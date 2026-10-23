@@ -5,7 +5,7 @@ AstrBot 插件，通过 QQ（NapCat / OneBot、`aiocqhttp` 适配器）下载 Pi
 ## 安装与使用
 
 1. 将插件放入 AstrBot 的 `data/plugins/` 目录，或在 WebUI 通过插件仓库地址安装。
-2. 在 WebUI 重载插件，并在插件配置中按需设置 Cookie 和图片镜像。
+2. 在 WebUI 重载插件，并在插件配置中按需设置 Cookie 和 Worker 代理。
 3. 在 QQ 中发送 `/pixiv 作品PID`，例如 `/pixiv 12345678`。示例 PID 仅展示命令格式，不保证作品可访问。命令前缀跟随 AstrBot 的唤醒前缀配置。
 
 仅接收正整数 PID，不支持作品链接、搜索或作者批量下载。支持静态单图、多页插画和漫画，不支持 ugoira 动图。
@@ -18,17 +18,17 @@ AstrBot 插件，通过 QQ（NapCat / OneBot、`aiocqhttp` 适配器）下载 Pi
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `pixiv_cookie` | 空 | 可选的 Pixiv Cookie 值，不包含 `Cookie:` 前缀，仅用于官方作品信息请求 |
-| `image_proxy_base_url` | 空 | 留空时直连图片；填写后通过兼容 pximg 路径的 Worker／镜像下载 |
+| `pixiv_cookie` | 空 | 可选的 Pixiv Cookie 值，不包含 `Cookie:` 前缀，仅用于作品信息请求，启用代理时经 Worker 转发 |
+| `image_proxy_base_url` | 空 | 留空时直连；填写后作品信息和原图全部通过同一个 Worker 访问，保留原配置键名 |
 | `direct_send_max_pages` | 3 | 作品页数不超过此值时直接发送图片；超过则打包 ZIP，设为 0 始终打包，必须为非负整数 |
 | `request_timeout` | 60 | 单次 HTTP 请求的总超时，单位秒，必须大于 0 |
 | `max_download_mb` | 200 | 单个作品原图的累计大小上限，单位 MiB，必须大于 0 |
 | `cleanup_interval_hours` | 0 | 定时清理间隔，单位小时，0 关闭；必须为非负整数 |
 | `cleanup_retention_hours` | 24 | 定时清理保留的 ZIP 时长，单位小时，0 表示清理全部；必须为非负整数 |
 
-Cookie 可从浏览器开发者工具的 Network 面板中，访问 `www.pixiv.net` 的请求头获取。界面会遮罩 Cookie，但配置文件仍以明文保存；不要分享 Cookie 或包含它的配置文件。插件不会把 Cookie 发给图片服务器或镜像，也不会将其写入日志。
+Cookie 可从浏览器开发者工具的 Network 面板中，访问 `www.pixiv.net` 的请求头获取。界面会遮罩 Cookie，但配置文件仍以明文保存；不要分享 Cookie 或包含它的配置文件。Cookie 仅用于作品信息请求：直连时发送给 Pixiv，启用代理时发送给配置的 Worker，再由 Worker 转发给 Pixiv，因此请使用自己部署或可信的 Worker。图片请求不携带 Cookie，插件也不会将 Cookie 写入日志。
 
-### 图片直连
+### 直连
 
 将 `image_proxy_base_url` 留空。插件下载图片时自动设置：
 
@@ -38,9 +38,18 @@ Referer: https://www.pixiv.net/
 
 运行 AstrBot 的网络必须能访问 `www.pixiv.net` 和 `i.pximg.net`。
 
-### Worker／图片镜像
+### Worker 全程代理
 
-将 `image_proxy_base_url` 设为自己的服务地址，例如 `https://images.example.com`。如果原图是：
+将 `image_proxy_base_url` 设为自己的 Worker 地址，例如 `https://images.example.com`。启用后，运行 AstrBot 的 PC 只需能连接这个 Worker 域名，无须直接访问 `www.pixiv.net` 或 `i.pximg.net`。Worker 自身需能访问这两个上游。
+
+作品详情与分页信息分别请求：
+
+```text
+https://images.example.com/ajax/illust/123
+https://images.example.com/ajax/illust/123/pages
+```
+
+Worker 将这些请求转发到 `https://www.pixiv.net` 的相同路径。如果原图是：
 
 ```text
 https://i.pximg.net/img-original/img/2026/01/01/00/00/00/123_p0.jpg
@@ -52,27 +61,45 @@ https://i.pximg.net/img-original/img/2026/01/01/00/00/00/123_p0.jpg
 https://images.example.com/img-original/img/2026/01/01/00/00/00/123_p0.jpg
 ```
 
-支持 `https://example.com/pximg` 这样的前缀地址，原图查询参数也会保留。服务须接受相同路径并直接返回图片。配置地址不接受账号密码、查询参数或 URL 片段。
+支持 `https://example.com/pximg` 这样的前缀地址，例如作品详情会请求 `/pximg/ajax/illust/123`。原图查询参数也会保留。服务须直接返回作品 JSON 或图片内容，不能重定向到上游；插件不会跟随重定向，也不会在代理失败后回退直连。配置地址不接受账号密码、查询参数或 URL 片段。
 
-可在 Cloudflare Worker 中部署以下用户提供的转发逻辑，再填入部署地址：
+在 Cloudflare Worker 中部署以下转发逻辑，再填入部署地址：
 
 ```javascript
 export default {
   fetch(request) {
     const url = new URL(request.url);
-    url.hostname = 'i.pximg.net';
+    // Set to '/pximg' when the configured proxy URL includes that prefix.
+    const pathPrefix = '';
+    if (pathPrefix) {
+      if (!url.pathname.startsWith(`${pathPrefix}/`)) {
+        return new Response('Not found', { status: 404 });
+      }
+      url.pathname = url.pathname.slice(pathPrefix.length);
+    }
 
-    const proxyRequest = new Request(url, request);
+    const isArtwork = /^\/ajax\/illust\/[0-9]+(?:\/pages)?$/.test(url.pathname);
+    url.protocol = 'https:';
+    url.hostname = isArtwork ? 'www.pixiv.net' : 'i.pximg.net';
+    url.port = '';
+
+    const proxyRequest = new Request(
+      url,
+      new Request(request, { redirect: 'manual' }),
+    );
     proxyRequest.headers.set('Referer', 'https://www.pixiv.net/');
+    if (!isArtwork) {
+      proxyRequest.headers.delete('Cookie');
+    }
 
     return fetch(proxyRequest);
   },
 };
 ```
 
-此示例适用于绑定在域名根路径的 Worker；使用路径前缀部署时，Worker 需先去掉该前缀再转发。插件只提供配置入口，不会替你部署 Worker。
+绑定在域名根路径时保留 `pathPrefix = ''`；配置地址为 `https://example.com/pximg` 时，将其设为 `'/pximg'`。插件只提供配置入口，不会替你部署 Worker。
 
-**图片 Worker 不代理作品信息。** 获取作品信息始终访问 Pixiv 官方 AJAX 接口，所以运行 AstrBot 的 PC 仍须能直接访问 `www.pixiv.net`。
+**旧版仅转发图片的 Worker／镜像必须更新为上述同时支持作品接口的版本。** 配置项仍使用 `image_proxy_base_url`，无需迁移配置；更新 Worker 后保存配置并重载插件即可。请求头中的 `Referer: https://www.pixiv.net/` 只是头字段，不会让本机连接 Pixiv。
 
 ## 文件保存与发送
 
@@ -114,4 +141,4 @@ uv run ruff format --check --no-respect-gitignore --config "exclude=[]" "data/pl
 uv run ruff check --no-respect-gitignore --config "exclude=[]" "data/plugins/astrbot_plugin_pixiv_dowlond"
 ```
 
-测试模拟 Pixiv 和图片服务，不需要真实 Cookie 或网络。实际验收还需在 NapCat 中分别验证群聊、私聊，以及直连和已部署 Worker 的原图下载。Pixiv AJAX 属于网站接口，可能随网站变动，需要以实际访问结果为准。
+测试模拟 Pixiv 和图片服务，不需要真实 Cookie 或外网，覆盖直连、Worker 根路径与路径前缀、Cookie 隔离，以及拒绝重定向和代理失败不回退直连。实际验收还需在 NapCat 中分别验证群聊、私聊，以及直连和已部署 Worker 的完整下载；代理模式可在本机无法连接 Pixiv 的环境中验证。Pixiv AJAX 属于网站接口，可能随网站变动，需要以实际访问结果为准。

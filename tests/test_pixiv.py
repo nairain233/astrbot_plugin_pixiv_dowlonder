@@ -93,6 +93,7 @@ async def http(monkeypatch):
             "/images/123_p0.png": web.Response(body=PNG, content_type="image/png"),
         },
         requests=[],
+        allowed_hosts=None,
     )
 
     async def handle(request):
@@ -132,12 +133,15 @@ async def http(monkeypatch):
         """
         state.requests.append((str(url), kwargs, session.cookie_jar))
         parsed = urlsplit(str(url))
+        if state.allowed_hosts is not None:
+            assert parsed.hostname in state.allowed_hosts
         local_url = f"http://127.0.0.1:{port}{parsed.path}"
         if parsed.query:
             local_url += f"?{parsed.query}"
         return await original_request(session, method, local_url, **kwargs)
 
     monkeypatch.setattr(aiohttp.ClientSession, "_request", route)
+    state.base_url = f"http://127.0.0.1:{port}"
     try:
         yield state
     finally:
@@ -148,12 +152,11 @@ async def http(monkeypatch):
 @pytest.mark.parametrize(
     "proxy", ["", "https://images.example.com", "https://images.example.com/pximg/"]
 )
+@pytest.mark.parametrize("cookie", ["", "PHPSESSID=test-secret"])
 async def test_complete_archive_and_cookie_isolation(
-    plugin, event, http, tmp_path, proxy
+    plugin, event, http, tmp_path, proxy, cookie
 ):
-    plugin.config.update(
-        {"pixiv_cookie": "PHPSESSID=test-secret", "image_proxy_base_url": proxy}
-    )
+    plugin.config.update({"pixiv_cookie": cookie, "image_proxy_base_url": proxy})
     prefix = "/pximg" if proxy.endswith("/pximg/") else ""
     http.routes["/ajax/illust/123/pages"] = web.json_response(
         {
@@ -174,6 +177,10 @@ async def test_complete_archive_and_cookie_isolation(
     http.routes[f"{prefix}/images/123_p1.jpg"] = web.Response(
         body=b"second-original", content_type="image/jpeg"
     )
+    if proxy:
+        http.allowed_hosts = {"images.example.com"}
+        for path in ("/ajax/illust/123", "/ajax/illust/123/pages"):
+            http.routes[prefix + path] = http.routes.pop(path)
     await plugin.pixiv(event, "00123")
 
     archives = list((tmp_path / "saved").glob("*.zip"))
@@ -194,17 +201,72 @@ async def test_complete_archive_and_cookie_isolation(
     assert not list((tmp_path / "temp").iterdir())
     assert not plugin._tasks
     assert len(http.requests) == 4
-    for url, options, jar in http.requests:
+    for index, (_, options, jar) in enumerate(http.requests):
         assert options["headers"]["Referer"] == "https://www.pixiv.net/"
         assert isinstance(jar, aiohttp.DummyCookieJar)
-        if url.startswith("https://www.pixiv.net/"):
-            assert options["headers"]["Cookie"] == "PHPSESSID=test-secret"
-            assert options["allow_redirects"] is False
+        assert options["allow_redirects"] is False
+        if index < 2 and cookie:
+            assert options["headers"]["Cookie"] == cookie
         else:
             assert "Cookie" not in options["headers"]
+    api_base = proxy.rstrip("/") if proxy else "https://www.pixiv.net"
+    assert http.requests[0][0] == api_base + "/ajax/illust/123"
+    assert http.requests[1][0] == api_base + "/ajax/illust/123/pages"
     expected = proxy.rstrip("/") if proxy else "https://i.pximg.net"
     assert http.requests[2][0] == expected + "/images/123_p0.png?token=a%2Fb"
+    assert http.requests[3][0] == expected + "/images/123_p1.jpg"
     assert "test-secret" not in str(plugin.logger.mock_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [302, 502])
+@pytest.mark.parametrize(
+    ("path", "request_count"),
+    [("/ajax/illust/123", 1), ("/ajax/illust/123/pages", 2), ("/images/123_p0.png", 3)],
+)
+async def test_proxy_failure_never_redirects_or_falls_back(
+    plugin, event, http, tmp_path, status, path, request_count
+):
+    """Keep every request on the Worker even when an upstream step fails.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting responses.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+        status: Proxy failure or redirect response status.
+        path: Artwork or image endpoint that fails.
+        request_count: Number of requests before stopping.
+    """
+    plugin.config["image_proxy_base_url"] = "https://images.example.com/pximg"
+    http.allowed_hosts = {"images.example.com"}
+    redirected = []
+
+    async def redirect_target(request):
+        """Record any incorrectly followed redirect.
+
+        Args:
+            request: Unexpected redirected HTTP request.
+
+        Returns:
+            A response that must never be requested.
+        """
+        redirected.append(request.path)
+        return web.Response(body=PNG, content_type="image/png")
+
+    http.routes[path] = web.Response(
+        status=status, headers={"Location": http.base_url + "/redirected"}
+    )
+    http.routes = {"/pximg" + path: response for path, response in http.routes.items()}
+    http.routes["/redirected"] = redirect_target
+    await plugin.pixiv(event, "123")
+    message = event.send.call_args.args[0].chain[0].text
+    assert "跳转" in message if status == 302 else "HTTP 502" in message
+    assert len(http.requests) == request_count
+    assert all(options["allow_redirects"] is False for _, options, _ in http.requests)
+    assert not redirected
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
 
 
 @pytest.mark.asyncio
@@ -243,10 +305,10 @@ async def test_bad_pid_does_not_start_download(plugin, event, http, pid):
         ({"request_timeout": "nan"}, "必须为正数"),
         ({"max_download_mb": "inf"}, "必须为正数"),
         ({"request_timeout": "bad"}, "配置"),
-        ({"image_proxy_base_url": "ftp://example.com"}, "图片代理地址"),
-        ({"image_proxy_base_url": "https://user:password@example.com"}, "图片代理地址"),
-        ({"image_proxy_base_url": "https://example.com?token=secret"}, "图片代理地址"),
-        ({"image_proxy_base_url": "https://example.com/#fragment"}, "图片代理地址"),
+        ({"image_proxy_base_url": "ftp://example.com"}, "代理地址"),
+        ({"image_proxy_base_url": "https://user:password@example.com"}, "代理地址"),
+        ({"image_proxy_base_url": "https://example.com?token=secret"}, "代理地址"),
+        ({"image_proxy_base_url": "https://example.com/#fragment"}, "代理地址"),
         ({"pixiv_cookie": "foo=bar\nSecret: value"}, "Cookie 不能包含换行"),
         ({"direct_send_max_pages": -1}, "直接发送页数上限"),
         ({"direct_send_max_pages": 1.5}, "直接发送页数上限"),

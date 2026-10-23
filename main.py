@@ -230,7 +230,7 @@ class PixivDownloader(Star):
                     or parsed.fragment
                 ):
                     raise PixivDownloadError(
-                        "图片代理地址应为 HTTP(S) 地址，可含路径前缀，不能含账号、查询参数或片段。"
+                        "代理地址应为 HTTP(S) 地址，可含路径前缀，不能含账号、查询参数或片段。"
                     )
             cookie = str(self.config.get("pixiv_cookie", "")).strip()
             if "\r" in cookie or "\n" in cookie:
@@ -333,7 +333,7 @@ class PixivDownloader(Star):
         except asyncio.TimeoutError:
             await event.send(
                 event.plain_result(
-                    "下载失败：请求超时，请检查网络或图片代理，或调大请求超时。"
+                    "下载失败：请求超时，请检查网络或 Worker 代理，或调大请求超时。"
                 )
             )
         except aiohttp.ClientError as exc:
@@ -342,7 +342,7 @@ class PixivDownloader(Star):
             )
             await event.send(
                 event.plain_result(
-                    "下载失败：网络请求异常，请检查 Pixiv 连通性及图片代理配置。"
+                    "下载失败：网络请求异常，请检查配置的 Worker 代理；未配置代理时请检查 Pixiv 连通性。"
                 )
             )
         except (TypeError, ValueError):
@@ -388,8 +388,8 @@ class PixivDownloader(Star):
             session: HTTP session without shared authentication headers.
             pid: Validated numeric artwork ID.
             images: Empty directory belonging to this request.
-            cookie: Optional login cookie sent only to the official AJAX API.
-            proxy: Optional image proxy base URL, including any path prefix.
+            cookie: Optional login cookie for AJAX requests, including via the proxy.
+            proxy: Optional base URL for all Pixiv requests, including any path prefix.
             limit: Maximum cumulative number of original-image bytes.
 
         Returns:
@@ -403,9 +403,10 @@ class PixivDownloader(Star):
         if cookie:
             headers["Cookie"] = cookie
         pages = []
+        api_base = proxy or "https://www.pixiv.net"
         for suffix in ("", "/pages"):
             async with session.get(
-                f"https://www.pixiv.net/ajax/illust/{pid}{suffix}",
+                f"{api_base}/ajax/illust/{pid}{suffix}",
                 headers=headers,
                 allow_redirects=False,
             ) as response:
@@ -470,13 +471,19 @@ class PixivDownloader(Star):
                 image_url = proxy + urlunsplit(("", "", parsed.path, parsed.query, ""))
             path = images / f"{pid}_p{index}{Path(parsed.path).suffix.lower()}"
             async with session.get(
-                image_url, headers={"Referer": "https://www.pixiv.net/"}
+                image_url,
+                headers={"Referer": "https://www.pixiv.net/"},
+                allow_redirects=False,
             ) as response:
                 if response.status == 429:
                     raise PixivDownloadError("图片服务器请求过于频繁，请稍后重试。")
                 if response.status == 403:
                     raise PixivDownloadError(
                         "图片服务器拒绝访问，请检查 Referer 或图片代理配置。"
+                    )
+                if 300 <= response.status < 400:
+                    raise PixivDownloadError(
+                        "图片请求发生跳转，请检查 Worker／镜像是否直接返回图片。"
                     )
                 if response.status != 200:
                     raise PixivDownloadError(

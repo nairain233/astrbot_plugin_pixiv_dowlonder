@@ -1,6 +1,6 @@
 name: astrbot_plugin_pixiv_dowlonder
 display_name: Pixiv图片打包下载器
-desc: 按 PID 下载 Pixiv 原图，按页数直接发送或打包 ZIP，支持管理员一键清理、定时清理、图片代理及可选 Cookie。
+desc: 按 PID 下载 Pixiv 原图，按页数直接发送或打包 ZIP，支持管理员一键清理、定时清理、全程 Worker 代理及可选 Cookie。
 version: v1.2.0
 author: 夜雨
 repo: https://github.com/nairain233/astrbot_plugin_pixiv_dowlonder

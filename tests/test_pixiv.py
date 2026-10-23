@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import os
+import stat
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,9 @@ from astrbot.core.message import components
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.permission import PermissionType, PermissionTypeFilter
+from astrbot.core.star.star_handler import star_handlers_registry
 from data.plugins.astrbot_plugin_pixiv_dowlond import main as plugin_module
 
 PNG = base64.b64decode(
@@ -641,3 +646,256 @@ async def test_cancel_during_image_delivery_cleans_temp(plugin, event, http, tmp
     assert not list((tmp_path / "saved").iterdir())
     assert not list((tmp_path / "temp").iterdir())
     assert not plugin._tasks
+
+
+@pytest.mark.asyncio
+async def test_manual_cleanup_preserves_unrelated_files(plugin, event, tmp_path):
+    data = tmp_path / "saved"
+    generated = data / "123_20261023_120000_abcdef01.zip"
+    generated.write_bytes(b"archive")
+    unrelated = data / "personal.zip"
+    unrelated.write_bytes(b"keep")
+    directory = data / "456_20261023_120000_abcdef01.zip"
+    directory.mkdir()
+    nested = directory / "123_20261023_120000_abcdef02.zip"
+    nested.write_bytes(b"keep nested")
+    outside = tmp_path / "123_20261023_120000_abcdef03.zip"
+    outside.write_bytes(b"keep outside")
+    await plugin.pixiv_clean(event)
+    assert not generated.exists()
+    assert unrelated.read_bytes() == b"keep"
+    assert nested.read_bytes() == b"keep nested"
+    assert outside.read_bytes() == b"keep outside"
+    text = event.send.call_args.args[0].chain[0].text
+    assert "删除 1 个 ZIP" in text
+    assert "跳过 1 个" in text
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retention_and_manual_override(plugin, event, tmp_path):
+    data = tmp_path / "saved"
+    old = data / "123_20261021_120000_abcdef01.zip"
+    recent = data / "123_20261023_120000_abcdef02.zip"
+    old.write_bytes(b"old")
+    recent.write_bytes(b"recent")
+    past = plugin_module.time.time() - 48 * 3600
+    os.utime(old, (past, past))
+    assert await plugin._cleanup_archives(24) == (1, 3, 1, 0)
+    assert not old.exists() and recent.exists()
+    await plugin.pixiv_clean(event)
+    assert not recent.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link_type", ["symlink", "reparse"])
+async def test_cleanup_never_follows_links(plugin, tmp_path, monkeypatch, link_type):
+    path = tmp_path / "saved" / "123_20261023_120000_abcdef01.zip"
+    path.write_bytes(b"keep linked target")
+    original = Path.lstat
+    monkeypatch.setattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, raising=False)
+
+    def linked_info(candidate):
+        if candidate == path:
+            return SimpleNamespace(
+                st_mode=stat.S_IFLNK if link_type == "symlink" else stat.S_IFREG,
+                st_file_attributes=0x400 if link_type == "reparse" else 0,
+            )
+        return original(candidate)
+
+    monkeypatch.setattr(Path, "lstat", linked_info)
+    assert await plugin._cleanup_archives() == (0, 0, 1, 0)
+    assert path.read_bytes() == b"keep linked target"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_skips_archive_until_upload_finishes(
+    plugin, event, http, tmp_path
+):
+    protected = []
+
+    async def during_upload(message):
+        for component in message.chain:
+            if isinstance(component, File):
+                path = Path(component.file)
+                assert path in plugin._active_archives
+                assert await plugin._cleanup_archives() == (0, 0, 1, 0)
+                assert path.is_file()
+                protected.append(path)
+
+    event.send.side_effect = during_upload
+    await plugin.pixiv(event, "123")
+    assert len(protected) == 1
+    assert not plugin._active_archives
+    result = await plugin._cleanup_archives()
+    assert result[0] == 1 and result[1] > 0
+    assert not protected[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_upload_becomes_eligible_for_cleanup(plugin, event, http):
+    event.send.side_effect = [None, RuntimeError("upload failed"), None]
+    await plugin.pixiv(event, "123")
+    assert not plugin._active_archives
+    assert (await plugin._cleanup_archives())[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_parallel_cleanup_is_serialized(plugin, tmp_path):
+    for index in range(3):
+        (tmp_path / "saved" / f"123_20261023_120000_abcdef0{index}.zip").write_bytes(
+            b"zip"
+        )
+    results = await asyncio.gather(
+        plugin._cleanup_archives(), plugin._cleanup_archives()
+    )
+    assert sum(result[0] for result in results) == 3
+    assert sum(result[1] for result in results) == 9
+    assert all(result[3] == 0 for result in results)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_file_permission_failure(
+    plugin, event, tmp_path, monkeypatch
+):
+    blocked = tmp_path / "saved" / "123_20261023_120000_abcdef01.zip"
+    allowed = tmp_path / "saved" / "123_20261023_120000_abcdef02.zip"
+    blocked.write_bytes(b"keep")
+    allowed.write_bytes(b"remove")
+    original = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == blocked:
+            raise PermissionError("locked")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    await plugin.pixiv_clean(event)
+    assert blocked.is_file() and not allowed.exists()
+    assert "失败 1 个" in event.send.call_args.args[0].chain[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [PermissionError, RuntimeError])
+async def test_cleanup_reports_directory_failure(plugin, event, monkeypatch, error):
+    monkeypatch.setattr(
+        plugin_module.StarTools, "get_data_dir", MagicMock(side_effect=error)
+    )
+    await plugin.pixiv_clean(event)
+    assert "清理失败" in event.send.call_args.args[0].chain[0].text
+
+
+@pytest.mark.asyncio
+async def test_empty_cleanup(plugin, event):
+    await plugin.pixiv_clean(event)
+    assert "删除 0 个 ZIP" in event.send.call_args.args[0].chain[0].text
+
+
+def test_cleanup_command_is_admin_only(event):
+    metadata = star_handlers_registry.get_handler_by_full_name(
+        f"{plugin_module.__name__}_pixiv_clean"
+    )
+    permission = next(
+        item
+        for item in metadata.event_filters
+        if isinstance(item, PermissionTypeFilter)
+    )
+    command = next(
+        item for item in metadata.event_filters if isinstance(item, CommandFilter)
+    )
+    assert command.command_name == "pixiv_clean"
+    assert "pixiv清理" in command.alias
+    assert permission.permission_type == PermissionType.ADMIN
+    event.is_admin.return_value = False
+    assert not permission.filter(event, {})
+    event.is_admin.return_value = True
+    assert permission.filter(event, {})
+
+
+@pytest.mark.asyncio
+async def test_periodic_cleanup_defaults_to_disabled(plugin):
+    await plugin.initialize()
+    assert plugin._cleanup_task is None
+
+
+@pytest.mark.asyncio
+async def test_periodic_cleanup_converts_hours_to_seconds(plugin, monkeypatch):
+    loop = AsyncMock()
+    monkeypatch.setattr(plugin, "_cleanup_loop", loop)
+    plugin.config.update({"cleanup_interval_hours": 6, "cleanup_retention_hours": 24})
+    await plugin.initialize()
+    await asyncio.sleep(0)
+    loop.assert_awaited_once_with(6 * 3600, 24)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"cleanup_interval_hours": -1},
+        {"cleanup_interval_hours": True},
+        {"cleanup_interval_hours": 0.5},
+        {"cleanup_interval_hours": 1, "cleanup_retention_hours": -1},
+        {"cleanup_interval_hours": 1, "cleanup_retention_hours": "24"},
+    ],
+)
+async def test_invalid_periodic_cleanup_config_does_not_start(plugin, config):
+    plugin.config.update(config)
+    await plugin.initialize()
+    assert plugin._cleanup_task is None
+    plugin.logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_periodic_cleanup_waits_and_stops_on_unload(plugin, tmp_path):
+    path = tmp_path / "saved" / "123_20261023_120000_abcdef01.zip"
+    path.write_bytes(b"recent")
+    plugin.config.update({"cleanup_interval_hours": 1, "cleanup_retention_hours": 0})
+    await plugin.initialize()
+    task = plugin._cleanup_task
+    await plugin.initialize()
+    assert plugin._cleanup_task is task
+    await asyncio.sleep(0)
+    assert path.is_file() and not task.done()
+    await plugin.terminate()
+    assert task.cancelled()
+    assert path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_periodic_cleanup_applies_retention(plugin, tmp_path, monkeypatch):
+    old = tmp_path / "saved" / "123_20261021_120000_abcdef01.zip"
+    recent = tmp_path / "saved" / "123_20261023_120000_abcdef02.zip"
+    old.write_bytes(b"old")
+    recent.write_bytes(b"new")
+    past = plugin_module.time.time() - 48 * 3600
+    os.utime(old, (past, past))
+    original = plugin._cleanup_archives
+
+    async def run(retention):
+        result = await original(retention)
+        plugin._stopping = True
+        return result
+
+    monkeypatch.setattr(plugin, "_cleanup_archives", run)
+    await plugin._cleanup_loop(0, 24)
+    assert not old.exists() and recent.exists()
+    plugin.logger.info.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_periodic_cleanup_recovers_after_failure(plugin, monkeypatch):
+    calls = []
+
+    async def run(retention):
+        calls.append(retention)
+        if len(calls) == 1:
+            raise OSError("directory unavailable")
+        plugin._stopping = True
+        return 0, 0, 0, 0
+
+    monkeypatch.setattr(plugin, "_cleanup_archives", run)
+    await plugin._cleanup_loop(0, 24)
+    assert calls == [24, 24]
+    plugin.logger.warning.assert_called_once()
+    plugin.logger.info.assert_called_once()

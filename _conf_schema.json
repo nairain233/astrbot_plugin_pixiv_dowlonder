@@ -24,6 +24,18 @@
     "default": 60,
     "hint": "必须大于 0，包含连接和读取响应的时间。"
   },
+  "cleanup_interval_hours": {
+    "description": "定时清理间隔（小时）",
+    "type": "int",
+    "default": 0,
+    "hint": "设为 0 关闭定时清理；例如设为 6 则每 6 小时清理一次。重载插件后生效，首次清理会等待一个完整间隔。仅在 AstrBot 运行期间执行。"
+  },
+  "cleanup_retention_hours": {
+    "description": "ZIP 保留时长（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "定时清理仅删除超过此时长的插件 ZIP。设为 0 则每次清理所有未使用的插件 ZIP。管理员 /pixiv_clean 不受此保留时长限制。"
+  },
   "max_download_mb": {
     "description": "单次任务原图总大小上限（MiB）",
     "type": "int",

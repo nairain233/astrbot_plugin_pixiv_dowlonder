@@ -1,7 +1,9 @@
 import asyncio
 import re
 import shutil
+import stat
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -24,7 +26,7 @@ class PixivDownloadError(Exception):
     "astrbot_plugin_pixiv_dowlonder",
     "夜雨",
     "按页数直接发送 Pixiv 图片或打包 ZIP",
-    "1.1.0",
+    "1.2.0",
 )
 class PixivDownloader(Star):
     """Download a static Pixiv artwork and send images or a ZIP by page count."""
@@ -39,7 +41,142 @@ class PixivDownloader(Star):
         super().__init__(context)
         self.config = config
         self._tasks: set[asyncio.Task] = set()
+        self._active_archives: set[Path] = set()
+        self._cleanup_lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task | None = None
         self._stopping = False
+
+    async def initialize(self):
+        """Start optional periodic cleanup after validating its configuration."""
+        interval = self.config.get("cleanup_interval_hours", 0)
+        retention = self.config.get("cleanup_retention_hours", 24)
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (interval, retention)
+        ):
+            self.logger.warning(
+                "Invalid Pixiv cleanup configuration; scheduled cleanup is disabled."
+            )
+            return
+        if (
+            interval
+            and not self._stopping
+            and (self._cleanup_task is None or self._cleanup_task.done())
+        ):
+            self._cleanup_task = asyncio.create_task(
+                self._cleanup_loop(interval * 3600, retention)
+            )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("pixiv_clean", alias={"pixiv清理"})
+    async def pixiv_clean(self, event: AstrMessageEvent):
+        """Delete the plugin's saved ZIPs that are not currently in use.
+
+        Args:
+            event: Administrator command event receiving cleanup statistics.
+        """
+        if self._stopping:
+            await event.send(event.plain_result("插件正在停止，请稍后重试。"))
+            return
+        try:
+            removed, freed, skipped, failed = await self._cleanup_archives()
+        except (OSError, RuntimeError) as exc:
+            self.logger.warning("Pixiv cleanup failed (%s).", type(exc).__name__)
+            await event.send(
+                event.plain_result("清理失败：无法访问插件文件目录，请检查权限。")
+            )
+            return
+        await event.send(
+            event.plain_result(
+                f"清理完成：删除 {removed} 个 ZIP，释放 {freed / (1024 * 1024):.2f} MiB，跳过 {skipped} 个正在使用或非普通文件，失败 {failed} 个。"
+            )
+        )
+
+    async def _cleanup_archives(
+        self, retention_hours: int = 0
+    ) -> tuple[int, int, int, int]:
+        """Remove only generated ZIP files within the plugin data directory.
+
+        Args:
+            retention_hours: Minimum file age in hours; zero removes all ages.
+
+        Returns:
+            Counts of deleted files, freed bytes, skipped files, and failures.
+
+        Raises:
+            OSError: The plugin data directory cannot be accessed.
+            RuntimeError: AstrBot cannot resolve or create the data directory.
+        """
+        removed = freed = skipped = failed = 0
+        cutoff = time.time() - retention_hours * 3600
+        async with self._cleanup_lock:
+            data_dir = StarTools.get_data_dir(
+                "astrbot_plugin_pixiv_dowlonder"
+            ).resolve()
+            for path in data_dir.iterdir():
+                # Yield between files so downloads and uploads remain responsive.
+                await asyncio.sleep(0)
+                if self._stopping:
+                    break
+                if not re.fullmatch(
+                    r"[0-9]{1,20}_[0-9]{8}_[0-9]{6}_[0-9a-f]{8}\.zip", path.name
+                ):
+                    continue
+                if path in self._active_archives:
+                    skipped += 1
+                    continue
+                try:
+                    info = path.lstat()
+                    if not stat.S_ISREG(info.st_mode) or (
+                        getattr(info, "st_file_attributes", 0)
+                        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                    ):
+                        skipped += 1
+                        continue
+                    if retention_hours and info.st_mtime > cutoff:
+                        skipped += 1
+                        continue
+                    # Do not recurse or follow links outside this directory.
+                    path.unlink()
+                    removed += 1
+                    freed += info.st_size
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    failed += 1
+                    self.logger.warning(
+                        "Unable to remove Pixiv archive %s (%s).",
+                        path.name,
+                        type(exc).__name__,
+                    )
+        return removed, freed, skipped, failed
+
+    async def _cleanup_loop(self, interval_seconds: int, retention_hours: int):
+        """Run retention cleanup at a fixed interval until plugin termination.
+
+        Args:
+            interval_seconds: Delay before each cleanup, including the first.
+            retention_hours: Minimum age of archives eligible for deletion.
+        """
+        while not self._stopping:
+            await asyncio.sleep(interval_seconds)
+            if self._stopping:
+                break
+            try:
+                removed, freed, skipped, failed = await self._cleanup_archives(
+                    retention_hours
+                )
+                self.logger.info(
+                    "Pixiv scheduled cleanup removed %s files, freed %s bytes, skipped %s files, and failed on %s files.",
+                    removed,
+                    freed,
+                    skipped,
+                    failed,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Pixiv scheduled cleanup failed (%s).", type(exc).__name__
+                )
 
     @filter.command("pixiv")
     async def pixiv(self, event: AstrMessageEvent, pid: str = ""):
@@ -113,7 +250,7 @@ class PixivDownloader(Star):
                     timeout=aiohttp.ClientTimeout(total=timeout),
                     cookie_jar=aiohttp.DummyCookieJar(),
                     headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/1.1)"
+                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/1.2)"
                     },
                 ) as session:
                     page_count = await self._download(
@@ -169,6 +306,7 @@ class PixivDownloader(Star):
                     raise
                 name = f"{pid}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:8]}.zip"
                 archive = data_dir / name
+                self._active_archives.add(archive)
                 Path(packed).replace(archive)
 
             try:
@@ -231,6 +369,8 @@ class PixivDownloader(Star):
                 message += f" ZIP 已保留在：{archive}"
             await event.send(event.plain_result(message))
         finally:
+            if archive is not None:
+                self._active_archives.discard(archive)
             self._tasks.discard(task)
 
     async def _download(
@@ -368,8 +508,12 @@ class PixivDownloader(Star):
     async def terminate(self):
         """Cancel active downloads and wait for temporary-file cleanup."""
         self._stopping = True
-        tasks = tuple(self._tasks)
+        tasks = list(self._tasks)
+        if self._cleanup_task is not None:
+            tasks.append(self._cleanup_task)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._cleanup_lock:
+            pass

@@ -12,6 +12,12 @@
     "default": "",
     "hint": "留空则直连 i.pximg.net 并设置 Referer。填写如 https://images.example.com 或 https://example.com/pximg，会保留原图路径和查询参数。这里只代理图片，作品信息仍直连 www.pixiv.net。"
   },
+  "direct_send_max_pages": {
+    "description": "直接发送页数上限",
+    "type": "int",
+    "default": 3,
+    "hint": "作品总页数不超过该值时，按页序直接发送图片，不生成 ZIP；超过则打包 ZIP。设为 0 可关闭直接发送，始终打包。必须是大于等于 0 的整数。"
+  },
   "request_timeout": {
     "description": "单次 HTTP 请求超时（秒）",
     "type": "int",

@@ -1,7 +1,7 @@
 name: astrbot_plugin_pixiv_dowlonder
 display_name: Pixiv图片打包下载器
-desc: 使用 /pixiv PID 下载作品的全部静态原图，打包 ZIP 后发送至 QQ，支持图片 Worker／镜像和可选登录 Cookie。
-version: v1.0.0
+desc: 使用 /pixiv PID 下载作品的全部静态原图，按页数直接发送图片或打包 ZIP，支持图片 Worker／镜像和可选登录 Cookie。
+version: v1.1.0
 author: 夜雨
 repo: https://github.com/nairain233/astrbot_plugin_pixiv_dowlonder
 support_platforms:

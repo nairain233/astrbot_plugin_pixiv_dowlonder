@@ -11,7 +11,7 @@ import aiohttp
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import File
+from astrbot.api.message_components import File, Image
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
@@ -21,10 +21,13 @@ class PixivDownloadError(Exception):
 
 
 @register(
-    "astrbot_plugin_pixiv_dowlonder", "夜雨", "下载 Pixiv 原图并打包发送 ZIP", "1.0.0"
+    "astrbot_plugin_pixiv_dowlonder",
+    "夜雨",
+    "按页数直接发送 Pixiv 图片或打包 ZIP",
+    "1.1.0",
 )
 class PixivDownloader(Star):
-    """Download a static Pixiv artwork and send its original images as a ZIP."""
+    """Download a static Pixiv artwork and send images or a ZIP by page count."""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         """Initialize configuration and track in-flight commands.
@@ -43,7 +46,7 @@ class PixivDownloader(Star):
         """Download all original images for a numeric Pixiv artwork ID.
 
         Args:
-            event: Message event receiving the ZIP attachment.
+            event: Message event receiving the images or ZIP attachment.
             pid: Positive numeric artwork ID.
         """
         if not re.fullmatch(r"[0-9]{1,20}", pid) or int(pid) == 0:
@@ -71,6 +74,13 @@ class PixivDownloader(Star):
                 raise PixivDownloadError(
                     "请求超时和下载大小上限必须为正数，请检查插件配置。"
                 )
+            direct_pages = self.config.get("direct_send_max_pages", 3)
+            if (
+                not isinstance(direct_pages, int)
+                or isinstance(direct_pages, bool)
+                or direct_pages < 0
+            ):
+                raise PixivDownloadError("直接发送页数上限必须是大于等于 0 的整数。")
             proxy = str(self.config.get("image_proxy_base_url", "")).strip().rstrip("/")
             if proxy:
                 parsed = urlsplit(proxy)
@@ -89,7 +99,6 @@ class PixivDownloader(Star):
             if "\r" in cookie or "\n" in cookie:
                 raise PixivDownloadError("Cookie 不能包含换行，请检查插件配置。")
 
-            data_dir = StarTools.get_data_dir("astrbot_plugin_pixiv_dowlonder")
             temp_root = Path(get_astrbot_temp_path())
             temp_root.mkdir(parents=True, exist_ok=True)
             await event.send(
@@ -104,13 +113,46 @@ class PixivDownloader(Star):
                     timeout=aiohttp.ClientTimeout(total=timeout),
                     cookie_jar=aiohttp.DummyCookieJar(),
                     headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/1.0)"
+                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/1.1)"
                     },
                 ) as session:
                     page_count = await self._download(
                         session, pid, images, cookie, proxy, int(limit * 1024 * 1024)
                     )
 
+                if 0 < page_count <= direct_pages:
+                    for index, image in enumerate(
+                        sorted(
+                            images.iterdir(),
+                            key=lambda path: int(path.stem.rsplit("_p", 1)[1]),
+                        ),
+                        start=1,
+                    ):
+                        try:
+                            await event.send(
+                                event.chain_result([Image.fromFileSystem(image)])
+                            )
+                        except Exception as exc:
+                            self.logger.warning(
+                                "Pixiv image upload failed for PID %s page %s (%s).",
+                                pid,
+                                index,
+                                type(exc).__name__,
+                            )
+                            await event.send(
+                                event.plain_result(
+                                    f"作品 {pid} 已下载，但第 {index} 张图片发送失败，已发送 {index - 1}/{page_count} 张。请检查 NapCat 状态，或将直接发送页数上限设为 0 后重试，改用 ZIP。"
+                                )
+                            )
+                            return
+                    await event.send(
+                        event.plain_result(
+                            f"作品 {pid} 下载完成，共 {page_count} 张原图，已直接发送。"
+                        )
+                    )
+                    return
+
+                data_dir = StarTools.get_data_dir("astrbot_plugin_pixiv_dowlonder")
                 # Await the worker even on cancellation before removing its input files.
                 packing = asyncio.create_task(
                     asyncio.to_thread(

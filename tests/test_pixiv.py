@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlsplit
@@ -12,7 +13,7 @@ import pytest_asyncio
 from aiohttp import web
 
 from astrbot.api.event import MessageChain, MessageEventResult
-from astrbot.api.message_components import File
+from astrbot.api.message_components import File, Image
 from astrbot.core.message import components
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
@@ -41,7 +42,7 @@ def plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(
         plugin_module, "get_astrbot_temp_path", lambda: str(tmp_path / "temp")
     )
-    instance = plugin_module.PixivDownloader(MagicMock(), {})
+    instance = plugin_module.PixivDownloader(MagicMock(), {"direct_send_max_pages": 0})
     instance.logger = MagicMock()
     return instance
 
@@ -242,6 +243,10 @@ async def test_bad_pid_does_not_start_download(plugin, event, http, pid):
         ({"image_proxy_base_url": "https://example.com?token=secret"}, "图片代理地址"),
         ({"image_proxy_base_url": "https://example.com/#fragment"}, "图片代理地址"),
         ({"pixiv_cookie": "foo=bar\nSecret: value"}, "Cookie 不能包含换行"),
+        ({"direct_send_max_pages": -1}, "直接发送页数上限"),
+        ({"direct_send_max_pages": 1.5}, "直接发送页数上限"),
+        ({"direct_send_max_pages": "3"}, "直接发送页数上限"),
+        ({"direct_send_max_pages": True}, "直接发送页数上限"),
     ],
 )
 async def test_invalid_config(plugin, event, http, config, message):
@@ -502,3 +507,137 @@ async def test_broken_image_stream(plugin, event, http, tmp_path):
     assert "网络请求异常" in event.send.call_args.args[0].chain[0].text
     assert not list((tmp_path / "saved").iterdir())
     assert not list((tmp_path / "temp").iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("threshold", "page_count", "direct"),
+    [
+        (None, 1, True),
+        (None, 3, True),
+        (None, 4, False),
+        (0, 1, False),
+        (2, 2, True),
+        (2, 3, False),
+        (12, 12, True),
+    ],
+)
+async def test_page_threshold_and_image_delivery(
+    plugin, event, http, tmp_path, monkeypatch, threshold, page_count, direct
+):
+    if threshold is None:
+        plugin.config.pop("direct_send_max_pages")
+    else:
+        plugin.config["direct_send_max_pages"] = threshold
+    http.routes["/ajax/illust/123/pages"] = web.json_response(
+        {
+            "body": [
+                {"urls": {"original": f"https://i.pximg.net/images/123_p{index}.png"}}
+                for index in range(page_count)
+            ]
+        }
+    )
+    for index in range(page_count):
+        http.routes[f"/images/123_p{index}.png"] = web.Response(
+            body=PNG + str(index).encode(), content_type="image/png"
+        )
+    packing = MagicMock(wraps=plugin_module.shutil.make_archive)
+    monkeypatch.setattr(plugin_module.shutil, "make_archive", packing)
+    delivered = []
+
+    async def receive(message):
+        for component in message.chain:
+            if isinstance(component, Image):
+                path = Path(component.path)
+                assert len(list(path.parent.iterdir())) == page_count
+                payload = await AiocqhttpMessageEvent._from_segment_to_dict(component)
+                assert payload["type"] == "image"
+                assert (
+                    payload["data"]["file"]
+                    == "base64://" + base64.b64encode(path.read_bytes()).decode()
+                )
+                delivered.append((path.name, path.read_bytes()))
+
+    event.send.side_effect = receive
+    await plugin.pixiv(event, "123")
+    archives = list((tmp_path / "saved").glob("*.zip"))
+    if direct:
+        assert delivered == [
+            (f"123_p{index}.png", PNG + str(index).encode())
+            for index in range(page_count)
+        ]
+        assert not archives
+        packing.assert_not_called()
+        assert "已直接发送" in event.send.call_args.args[0].chain[0].text
+    else:
+        assert not delivered
+        assert len(archives) == 1
+        packing.assert_called_once()
+        assert "ZIP 已发送" in event.send.call_args.args[0].chain[0].text
+    assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_page", [1, 2])
+async def test_image_delivery_failure_stops_without_zip(
+    plugin, event, http, tmp_path, failed_page
+):
+    plugin.config["direct_send_max_pages"] = 3
+    http.routes["/ajax/illust/123/pages"] = web.json_response(
+        {
+            "body": [
+                {"urls": {"original": f"https://i.pximg.net/images/123_p{index}.png"}}
+                for index in range(3)
+            ]
+        }
+    )
+    for index in range(3):
+        http.routes[f"/images/123_p{index}.png"] = web.Response(
+            body=PNG, content_type="image/png"
+        )
+    attempted = []
+
+    async def fail(message):
+        for component in message.chain:
+            if isinstance(component, Image):
+                path = Path(component.path)
+                assert path.is_file()
+                attempted.append(path.name)
+                if len(attempted) == failed_page:
+                    raise RuntimeError("image upload failed")
+
+    event.send.side_effect = fail
+    await plugin.pixiv(event, "123")
+    assert len(attempted) == failed_page
+    text = event.send.call_args.args[0].chain[0].text
+    assert f"第 {failed_page} 张图片发送失败" in text
+    assert f"已发送 {failed_page - 1}/3 张" in text
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._tasks
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_image_delivery_cleans_temp(plugin, event, http, tmp_path):
+    plugin.config["direct_send_max_pages"] = 1
+    started = asyncio.Event()
+    paths = []
+
+    async def block(message):
+        for component in message.chain:
+            if isinstance(component, Image):
+                paths.append(Path(component.path))
+                started.set()
+                await asyncio.Event().wait()
+
+    event.send.side_effect = block
+    task = asyncio.create_task(plugin.pixiv(event, "123"))
+    await asyncio.wait_for(started.wait(), 2)
+    assert paths[0].is_file()
+    await plugin.terminate()
+    assert task.cancelled()
+    assert not paths[0].exists()
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._tasks

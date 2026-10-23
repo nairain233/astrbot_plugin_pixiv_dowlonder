@@ -1,0 +1,27 @@
+{
+  "pixiv_cookie": {
+    "description": "Pixiv 登录 Cookie（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "填写浏览器访问 www.pixiv.net 时请求头中的 Cookie 值。仅发送到 Pixiv 官方作品接口，不发送给图片镜像。配置以明文保存在本机，请妥善保管。"
+  },
+  "image_proxy_base_url": {
+    "description": "图片 Worker／镜像地址（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "留空则直连 i.pximg.net 并设置 Referer。填写如 https://images.example.com 或 https://example.com/pximg，会保留原图路径和查询参数。这里只代理图片，作品信息仍直连 www.pixiv.net。"
+  },
+  "request_timeout": {
+    "description": "单次 HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "必须大于 0，包含连接和读取响应的时间。"
+  },
+  "max_download_mb": {
+    "description": "单次任务原图总大小上限（MiB）",
+    "type": "int",
+    "default": 200,
+    "hint": "必须大于 0。下载过程中累计实际字节数，超过上限则终止，不发送不完整 ZIP。此值不代表 QQ 的上传大小限制。"
+  }
+}

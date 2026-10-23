@@ -12,6 +12,7 @@ from zipfile import ZipFile
 import aiohttp
 import pytest
 import pytest_asyncio
+import pyzipper
 from aiohttp import web
 
 from astrbot.api.event import MessageChain, MessageEventResult
@@ -314,6 +315,8 @@ async def test_bad_pid_does_not_start_download(plugin, event, http, pid):
         ({"direct_send_max_pages": 1.5}, "直接发送页数上限"),
         ({"direct_send_max_pages": "3"}, "直接发送页数上限"),
         ({"direct_send_max_pages": True}, "直接发送页数上限"),
+        ({"zip_password": None}, "ZIP 解压密码必须是字符串"),
+        ({"zip_password": 123}, "ZIP 解压密码必须是字符串"),
     ],
 )
 async def test_invalid_config(plugin, event, http, config, message):
@@ -475,19 +478,21 @@ async def test_parallel_tasks_and_termination(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("password", ["", "test-zip-password"])
 async def test_cancel_during_zip_waits_for_worker_cleanup(
-    plugin, event, http, monkeypatch, tmp_path
+    plugin, event, http, monkeypatch, tmp_path, password
 ):
+    plugin.config["zip_password"] = password
     started = threading.Event()
     release = threading.Event()
-    original = plugin_module.shutil.make_archive
+    original = plugin._pack_archive
 
     def pack(*args, **kwargs):
         started.set()
         assert release.wait(5)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(plugin_module.shutil, "make_archive", pack)
+    monkeypatch.setattr(plugin, "_pack_archive", pack)
     task = asyncio.create_task(plugin.pixiv(event, "123"))
     try:
         assert await asyncio.to_thread(started.wait, 3)
@@ -770,9 +775,11 @@ async def test_cleanup_never_follows_links(plugin, tmp_path, monkeypatch, link_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("password", ["", "test-zip-password"])
 async def test_cleanup_skips_archive_until_upload_finishes(
-    plugin, event, http, tmp_path
+    plugin, event, http, tmp_path, password
 ):
+    plugin.config["zip_password"] = password
     protected = []
 
     async def during_upload(message):
@@ -961,3 +968,124 @@ async def test_periodic_cleanup_recovers_after_failure(plugin, monkeypatch):
     assert calls == [24, 24]
     plugin.logger.warning.assert_called_once()
     plugin.logger.info.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("password", ["test-zip-password-233", " 空 格 密码 "])
+@pytest.mark.parametrize("page_count", [1, 2])
+async def test_zip_is_encrypted_before_delivery(
+    plugin, event, http, tmp_path, password, page_count
+):
+    plugin.config["zip_password"] = password
+    http.routes["/ajax/illust/123/pages"] = web.json_response(
+        {
+            "body": [
+                {"urls": {"original": f"https://i.pximg.net/images/123_p{index}.png"}}
+                for index in range(page_count)
+            ]
+        }
+    )
+    for index in range(page_count):
+        http.routes[f"/images/123_p{index}.png"] = web.Response(
+            body=PNG + str(index).encode(), content_type="image/png"
+        )
+    delivered = []
+
+    async def receive(message):
+        for component in message.chain:
+            if isinstance(component, File):
+                path = Path(component.file)
+                with pyzipper.AESZipFile(str(path)) as archive:
+                    assert archive.namelist() == [
+                        f"123_p{index}.png" for index in range(page_count)
+                    ]
+                    for info in archive.infolist():
+                        assert info.flag_bits & 1
+                        assert info.wz_aes_strength == 3
+                    with pytest.raises(RuntimeError):
+                        archive.read("123_p0.png")
+                    with pytest.raises(RuntimeError):
+                        archive.read("123_p0.png", pwd=b"wrong-password")
+                    for index in range(page_count):
+                        assert (
+                            archive.read(
+                                f"123_p{index}.png", pwd=password.encode("utf-8")
+                            )
+                            == PNG + str(index).encode()
+                        )
+                delivered.append(path)
+
+    event.send.side_effect = receive
+    await plugin.pixiv(event, "123")
+    assert len(delivered) == 1
+    assert delivered[0].is_file()
+    assert "加密 ZIP 已发送" in event.send.call_args.args[0].chain[0].text
+    assert password not in str(event.send.call_args_list)
+    assert password not in str(plugin.logger.mock_calls)
+    assert password not in delivered[0].name
+    assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._tasks
+    assert not plugin._active_archives
+
+
+@pytest.mark.asyncio
+async def test_zip_password_does_not_override_direct_images(
+    plugin, event, http, tmp_path, monkeypatch
+):
+    plugin.config.update(
+        {"direct_send_max_pages": 3, "zip_password": "test-zip-password"}
+    )
+    packing = MagicMock(side_effect=AssertionError("direct images must not be packed"))
+    monkeypatch.setattr(plugin, "_pack_archive", packing)
+    await plugin.pixiv(event, "123")
+    images = [
+        component
+        for call in event.send.call_args_list
+        for component in call.args[0].chain
+        if isinstance(component, Image)
+    ]
+    assert len(images) == 1
+    assert "已直接发送" in event.send.call_args.args[0].chain[0].text
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+    packing.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_encryption_failure_never_sends_plain_zip(
+    plugin, event, http, tmp_path, monkeypatch
+):
+    password = "test-password-never-log"
+    plugin.config["zip_password"] = password
+    monkeypatch.setattr(
+        pyzipper.AESZipFile, "write", MagicMock(side_effect=RuntimeError(password))
+    )
+    plain_pack = MagicMock(side_effect=AssertionError("no unencrypted fallback"))
+    monkeypatch.setattr(plugin_module.shutil, "make_archive", plain_pack)
+    await plugin.pixiv(event, "123")
+    assert "加密 ZIP 生成失败" in event.send.call_args.args[0].chain[0].text
+    assert not any(
+        isinstance(component, File)
+        for call in event.send.call_args_list
+        for component in call.args[0].chain
+    )
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+    assert password not in str(event.send.call_args_list)
+    assert password not in str(plugin.logger.mock_calls)
+    plain_pack.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_encrypted_zip_retained_after_upload_failure(
+    plugin, event, http, tmp_path
+):
+    plugin.config["zip_password"] = "test-zip-password"
+    event.send.side_effect = [None, RuntimeError("upload failed"), None]
+    await plugin.pixiv(event, "123")
+    archive_path = next((tmp_path / "saved").glob("*.zip"))
+    assert "发送失败" in event.send.call_args.args[0].chain[0].text
+    with pyzipper.AESZipFile(str(archive_path)) as archive:
+        assert archive.read("123_p0.png", pwd=b"test-zip-password") == PNG
+    assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._active_archives

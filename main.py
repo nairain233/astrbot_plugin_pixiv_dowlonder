@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import aiohttp
+import pyzipper
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
@@ -26,7 +27,7 @@ class PixivDownloadError(Exception):
     "astrbot_plugin_pixiv_dowlonder",
     "夜雨",
     "按页数直接发送 Pixiv 图片或打包 ZIP",
-    "1.2.0",
+    "1.3.0",
 )
 class PixivDownloader(Star):
     """Download a static Pixiv artwork and send images or a ZIP by page count."""
@@ -218,6 +219,9 @@ class PixivDownloader(Star):
                 or direct_pages < 0
             ):
                 raise PixivDownloadError("直接发送页数上限必须是大于等于 0 的整数。")
+            zip_password = self.config.get("zip_password", "")
+            if not isinstance(zip_password, str):
+                raise PixivDownloadError("ZIP 解压密码必须是字符串，请检查插件配置。")
             proxy = str(self.config.get("image_proxy_base_url", "")).strip().rstrip("/")
             if proxy:
                 parsed = urlsplit(proxy)
@@ -250,7 +254,7 @@ class PixivDownloader(Star):
                     timeout=aiohttp.ClientTimeout(total=timeout),
                     cookie_jar=aiohttp.DummyCookieJar(),
                     headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/1.2)"
+                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/1.3)"
                     },
                 ) as session:
                     page_count = await self._download(
@@ -293,16 +297,27 @@ class PixivDownloader(Star):
                 # Await the worker even on cancellation before removing its input files.
                 packing = asyncio.create_task(
                     asyncio.to_thread(
-                        shutil.make_archive,
-                        str(work_dir / "archive"),
-                        "zip",
-                        root_dir=images,
+                        self._pack_archive,
+                        images,
+                        work_dir / "archive",
+                        zip_password,
                     )
                 )
                 try:
                     packed = await asyncio.shield(packing)
                 except asyncio.CancelledError:
                     await packing
+                    raise
+                except Exception as exc:
+                    if zip_password:
+                        self.logger.warning(
+                            "Pixiv ZIP encryption failed for PID %s (%s).",
+                            pid,
+                            type(exc).__name__,
+                        )
+                        raise PixivDownloadError(
+                            "加密 ZIP 生成失败，未发送文件，请检查插件依赖、磁盘空间及目录权限。"
+                        ) from exc
                     raise
                 name = f"{pid}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:8]}.zip"
                 archive = data_dir / name
@@ -323,9 +338,10 @@ class PixivDownloader(Star):
                     )
                 )
                 return
+            zip_label = "加密 ZIP" if zip_password else "ZIP"
             await event.send(
                 event.plain_result(
-                    f"作品 {pid} 下载完成，共 {page_count} 张原图。ZIP 已发送并保留在本地。"
+                    f"作品 {pid} 下载完成，共 {page_count} 张原图。{zip_label} 已发送并保留在本地。"
                 )
             )
         except PixivDownloadError as exc:
@@ -372,6 +388,36 @@ class PixivDownloader(Star):
             if archive is not None:
                 self._active_archives.discard(archive)
             self._tasks.discard(task)
+
+    @staticmethod
+    def _pack_archive(images: Path, base_name: Path, password: str) -> str:
+        """Create a plain or encrypted ZIP within the synchronous worker.
+
+        Args:
+            images: Task directory containing downloaded original images.
+            base_name: Archive path without the ZIP suffix.
+            password: Exact extraction password; empty disables encryption.
+
+        Returns:
+            Path to the complete archive, ready to move and send.
+
+        Raises:
+            OSError: An input or output file cannot be accessed.
+            RuntimeError: The encryption library cannot create the archive.
+        """
+        if not password:
+            return shutil.make_archive(str(base_name), "zip", root_dir=images)
+        archive_path = f"{base_name}.zip"
+        with pyzipper.AESZipFile(
+            archive_path, "w", compression=pyzipper.ZIP_DEFLATED
+        ) as archive:
+            archive.setpassword(password.encode("utf-8"))
+            archive.setencryption(pyzipper.WZ_AES, nbits=256)
+            for image in sorted(
+                images.iterdir(), key=lambda path: int(path.stem.rsplit("_p", 1)[1])
+            ):
+                archive.write(str(image), arcname=image.name)
+        return archive_path
 
     async def _download(
         self,

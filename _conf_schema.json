@@ -18,6 +18,13 @@
     "default": 3,
     "hint": "作品总页数不超过该值时，按页序直接发送图片，不生成 ZIP；超过则打包 ZIP。设为 0 可关闭直接发送，始终打包。必须是大于等于 0 的整数。"
   },
+  "zip_password": {
+    "description": "ZIP 解压密码（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "留空不加密；填写后仅对需要打包的 ZIP 使用 AES-256 加密，仍按页数直接发送小页数作品。密码不自动发送到聊天，请自行告知接收者；建议使用 7-Zip、WinRAR 等支持 AES ZIP 的软件解压。密码中的空格也会保留。"
+  },
   "request_timeout": {
     "description": "单次 HTTP 请求超时（秒）",
     "type": "int",

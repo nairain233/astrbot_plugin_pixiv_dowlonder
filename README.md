@@ -21,6 +21,7 @@ AstrBot 插件，通过 QQ（NapCat / OneBot、`aiocqhttp` 适配器）下载 Pi
 | `pixiv_cookie` | 空 | 可选的 Pixiv Cookie 值，不包含 `Cookie:` 前缀，仅用于作品信息请求，启用代理时经 Worker 转发 |
 | `image_proxy_base_url` | 空 | 留空时直连；填写后作品信息和原图全部通过同一个 Worker 访问，保留原配置键名 |
 | `direct_send_max_pages` | 3 | 作品页数不超过此值时直接发送图片；超过则打包 ZIP，设为 0 始终打包，必须为非负整数 |
+| `zip_password` | 空 | 留空不加密；填写后对需要打包的 ZIP 使用 AES-256 加密，不影响按页数直接发图 |
 | `request_timeout` | 60 | 单次 HTTP 请求的总超时，单位秒，必须大于 0 |
 | `max_download_mb` | 200 | 单个作品原图的累计大小上限，单位 MiB，必须大于 0 |
 | `cleanup_interval_hours` | 0 | 定时清理间隔，单位小时，0 关闭；必须为非负整数 |
@@ -100,6 +101,22 @@ export default {
 绑定在域名根路径时保留 `pathPrefix = ''`；配置地址为 `https://example.com/pximg` 时，将其设为 `'/pximg'`。插件只提供配置入口，不会替你部署 Worker。
 
 **旧版仅转发图片的 Worker／镜像必须更新为上述同时支持作品接口的版本。** 配置项仍使用 `image_proxy_base_url`，无需迁移配置；更新 Worker 后保存配置并重载插件即可。请求头中的 `Referer: https://www.pixiv.net/` 只是头字段，不会让本机连接 Pixiv。
+
+## ZIP 密码（可选）
+
+在 WebUI 的“ZIP 解压密码”中填写密码，保存并重载插件即可启用；留空则关闭。密码保留原样，支持中文，前后空格也是密码的一部分。
+
+密码只用于原本需要打包的作品：例如直接发送上限为 `3` 时，1～3 页仍直接发图，4 页及以上才生成加密 ZIP。若希望所有作品都生成加密 ZIP，可将直接发送页数上限设为 `0`。
+
+加密在发送前完成，本地保留的也是加密 ZIP。插件只提示“加密 ZIP 已发送”，不会将密码发送到聊天、写入日志或放进文件名；请自行告知接收者密码。WebUI 中的密码会遮罩，但仍以明文存储在本机插件配置文件中。
+
+使用支持 AES ZIP 的解压工具打开，例如 7-Zip 或 WinRAR；部分系统自带的解压工具可能不支持。ZIP 中的文件内容加密，文件名仍可查看。安装或升级插件时需安装 `requirements.txt` 中的 `pyzipper` 依赖；在源码部署中可于 AstrBot 项目根目录执行：
+
+```powershell
+uv pip install --python ".venv/Scripts/python.exe" -r "data/plugins/astrbot_plugin_pixiv_dowlond/requirements.txt"
+```
+
+上述路径适用于 Windows；Linux/macOS 使用 `.venv/bin/python`。
 
 ## 文件保存与发送
 

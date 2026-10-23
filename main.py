@@ -18,6 +18,12 @@ from astrbot.api.message_components import File, Image
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
+IMAGE_SIZES = {
+    "original": ("original", "原图"),
+    "1200": ("regular", "1200 像素预览图"),
+    "540": ("small", "540 像素预览图"),
+}
+
 
 class PixivDownloadError(Exception):
     """Represent an expected download failure safe to display to the user."""
@@ -27,7 +33,7 @@ class PixivDownloadError(Exception):
     "astrbot_plugin_pixiv_dowlonder",
     "夜雨",
     "按页数直接发送 Pixiv 图片或打包 ZIP",
-    "1.3.0",
+    "0.1.1",
 )
 class PixivDownloader(Star):
     """Download a static Pixiv artwork and send images or a ZIP by page count."""
@@ -181,7 +187,7 @@ class PixivDownloader(Star):
 
     @filter.command("pixiv")
     async def pixiv(self, event: AstrMessageEvent, pid: str = ""):
-        """Download all original images for a numeric Pixiv artwork ID.
+        """Download all artwork pages at the configured image size.
 
         Args:
             event: Message event receiving the images or ZIP attachment.
@@ -222,6 +228,10 @@ class PixivDownloader(Star):
             zip_password = self.config.get("zip_password", "")
             if not isinstance(zip_password, str):
                 raise PixivDownloadError("ZIP 解压密码必须是字符串，请检查插件配置。")
+            image_size = self.config.get("image_size", "original")
+            if not isinstance(image_size, str) or image_size not in IMAGE_SIZES:
+                raise PixivDownloadError("图片尺寸必须选择原图、1200 像素或 540 像素。")
+            image_label = IMAGE_SIZES[image_size][1]
             proxy = str(self.config.get("image_proxy_base_url", "")).strip().rstrip("/")
             if proxy:
                 parsed = urlsplit(proxy)
@@ -243,7 +253,9 @@ class PixivDownloader(Star):
             temp_root = Path(get_astrbot_temp_path())
             temp_root.mkdir(parents=True, exist_ok=True)
             await event.send(
-                event.plain_result(f"开始下载 Pixiv 作品 {pid} 的全部原图，请稍候。")
+                event.plain_result(
+                    f"开始下载 Pixiv 作品 {pid} 的全部{image_label}，请稍候。"
+                )
             )
             with tempfile.TemporaryDirectory(prefix="pixiv_", dir=temp_root) as temp:
                 work_dir = Path(temp)
@@ -254,11 +266,17 @@ class PixivDownloader(Star):
                     timeout=aiohttp.ClientTimeout(total=timeout),
                     cookie_jar=aiohttp.DummyCookieJar(),
                     headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/1.3)"
+                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/0.1.1)"
                     },
                 ) as session:
                     page_count = await self._download(
-                        session, pid, images, cookie, proxy, int(limit * 1024 * 1024)
+                        session,
+                        pid,
+                        images,
+                        cookie,
+                        proxy,
+                        int(limit * 1024 * 1024),
+                        image_size,
                     )
 
                 if 0 < page_count <= direct_pages:
@@ -288,7 +306,7 @@ class PixivDownloader(Star):
                             return
                     await event.send(
                         event.plain_result(
-                            f"作品 {pid} 下载完成，共 {page_count} 张原图，已直接发送。"
+                            f"作品 {pid} 下载完成，共 {page_count} 张{image_label}，已直接发送。"
                         )
                     )
                     return
@@ -341,7 +359,7 @@ class PixivDownloader(Star):
             zip_label = "加密 ZIP" if zip_password else "ZIP"
             await event.send(
                 event.plain_result(
-                    f"作品 {pid} 下载完成，共 {page_count} 张原图。{zip_label} 已发送并保留在本地。"
+                    f"作品 {pid} 下载完成，共 {page_count} 张{image_label}。{zip_label} 已发送并保留在本地。"
                 )
             )
         except PixivDownloadError as exc:
@@ -394,7 +412,7 @@ class PixivDownloader(Star):
         """Create a plain or encrypted ZIP within the synchronous worker.
 
         Args:
-            images: Task directory containing downloaded original images.
+            images: Task directory containing the selected image versions.
             base_name: Archive path without the ZIP suffix.
             password: Exact extraction password; empty disables encryption.
 
@@ -427,8 +445,9 @@ class PixivDownloader(Star):
         cookie: str,
         proxy: str,
         limit: int,
+        image_size: str = "original",
     ) -> int:
-        """Resolve artwork pages and stream every original into a task directory.
+        """Resolve artwork pages and stream the selected versions into a directory.
 
         Args:
             session: HTTP session without shared authentication headers.
@@ -436,7 +455,8 @@ class PixivDownloader(Star):
             images: Empty directory belonging to this request.
             cookie: Optional login cookie for AJAX requests, including via the proxy.
             proxy: Optional base URL for all Pixiv requests, including any path prefix.
-            limit: Maximum cumulative number of original-image bytes.
+            limit: Maximum cumulative number of downloaded image bytes.
+            image_size: Original, 1200-pixel, or 540-pixel version to request.
 
         Returns:
             Number of successfully downloaded pages.
@@ -446,6 +466,7 @@ class PixivDownloader(Star):
             aiohttp.ClientError: An HTTP transport error occurs.
         """
         headers = {"Referer": "https://www.pixiv.net/"}
+        url_key, image_label = IMAGE_SIZES[image_size]
         if cookie:
             headers["Cookie"] = cookie
         pages = []
@@ -501,18 +522,21 @@ class PixivDownloader(Star):
         total = 0
         for index, page in enumerate(pages):
             urls = page.get("urls") if isinstance(page, dict) else None
-            original = urls.get("original") if isinstance(urls, dict) else None
-            if not isinstance(original, str):
-                raise PixivDownloadError("Pixiv 原图地址缺失。")
-            parsed = urlsplit(original)
+            image_url = urls.get(url_key) if isinstance(urls, dict) else None
+            if not isinstance(image_url, str):
+                raise PixivDownloadError(
+                    f"Pixiv {image_label}地址缺失，请尝试其他图片尺寸。"
+                )
+            parsed = urlsplit(image_url)
             if (
                 parsed.scheme != "https"
                 or parsed.netloc != "i.pximg.net"
                 or Path(parsed.path).suffix.lower()
                 not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}
             ):
-                raise PixivDownloadError("Pixiv 返回了不支持的原图地址或格式。")
-            image_url = original
+                raise PixivDownloadError(
+                    f"Pixiv 返回了不支持的{image_label}地址或格式。"
+                )
             if proxy:
                 image_url = proxy + urlunsplit(("", "", parsed.path, parsed.query, ""))
             path = images / f"{pid}_p{index}{Path(parsed.path).suffix.lower()}"
@@ -543,7 +567,7 @@ class PixivDownloader(Star):
                     response.content_length is not None
                     and total + response.content_length > limit
                 ):
-                    raise PixivDownloadError("作品原图总大小超过配置上限，未生成 ZIP。")
+                    raise PixivDownloadError("作品图片总大小超过配置上限，未生成 ZIP。")
                 size = 0
                 with path.open("wb") as output:
                     async for chunk in response.content.iter_chunked(64 * 1024):
@@ -551,7 +575,7 @@ class PixivDownloader(Star):
                         size += len(chunk)
                         if total > limit:
                             raise PixivDownloadError(
-                                "作品原图总大小超过配置上限，未生成 ZIP。"
+                                "作品图片总大小超过配置上限，未生成 ZIP。"
                             )
                         output.write(chunk)
                 if not size:

@@ -317,6 +317,10 @@ async def test_bad_pid_does_not_start_download(plugin, event, http, pid):
         ({"direct_send_max_pages": True}, "直接发送页数上限"),
         ({"zip_password": None}, "ZIP 解压密码必须是字符串"),
         ({"zip_password": 123}, "ZIP 解压密码必须是字符串"),
+        ({"image_size": "720"}, "图片尺寸必须选择"),
+        ({"image_size": 540}, "图片尺寸必须选择"),
+        ({"image_size": None}, "图片尺寸必须选择"),
+        ({"image_size": []}, "图片尺寸必须选择"),
     ],
 )
 async def test_invalid_config(plugin, event, http, config, message):
@@ -1089,3 +1093,150 @@ async def test_encrypted_zip_retained_after_upload_failure(
         assert archive.read("123_p0.png", pwd=b"test-zip-password") == PNG
     assert not list((tmp_path / "temp").iterdir())
     assert not plugin._active_archives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_size", ["original", "1200", "540"])
+@pytest.mark.parametrize("proxy", ["", "https://images.example.com/pximg"])
+@pytest.mark.parametrize("delivery", ["direct", "zip", "encrypted"])
+async def test_selected_image_size_for_all_delivery_modes(
+    plugin, event, http, tmp_path, image_size, proxy, delivery
+):
+    plugin.config.update(
+        {
+            "image_size": image_size,
+            "image_proxy_base_url": proxy,
+            "direct_send_max_pages": 3 if delivery == "direct" else 0,
+            "zip_password": "test-password" if delivery == "encrypted" else "",
+        }
+    )
+    definitions = {
+        "original": ("original", "/img-original/123_p{}.png", PNG),
+        "1200": ("regular", "/img-master/123_p{}_master1200.jpg", b"regular-jpeg"),
+        "540": (
+            "small",
+            "/c/540x540_70/img-master/123_p{}_master1200.jpg",
+            b"small-jpeg",
+        ),
+    }
+    _, template, content = definitions[image_size]
+    suffix = ".png" if image_size == "original" else ".jpg"
+    plugin.config["max_download_mb"] = (2 * (len(content) + 1) + 1) / (1024 * 1024)
+    pages = [
+        {
+            "urls": {
+                key: "https://i.pximg.net" + path.format(index) + "?token=a%2Fb"
+                for key, path, _ in definitions.values()
+            }
+        }
+        for index in range(2)
+    ]
+    prefix = "/pximg" if proxy else ""
+    http.routes[prefix + "/ajax/illust/123/pages"] = web.json_response({"body": pages})
+    if proxy:
+        http.allowed_hosts = {"images.example.com"}
+        http.routes[prefix + "/ajax/illust/123"] = http.routes.pop("/ajax/illust/123")
+    for index in range(2):
+        http.routes[prefix + template.format(index)] = web.Response(
+            body=content + str(index).encode(),
+            content_type="image/png" if image_size == "original" else "image/jpeg",
+        )
+    delivered = []
+
+    async def receive(message):
+        for component in message.chain:
+            if isinstance(component, Image):
+                path = Path(component.path)
+                delivered.append((path.name, path.read_bytes()))
+
+    event.send.side_effect = receive
+    await plugin.pixiv(event, "123")
+    expected = [
+        (f"123_p{index}{suffix}", content + str(index).encode()) for index in range(2)
+    ]
+    archives = list((tmp_path / "saved").glob("*.zip"))
+    if delivery == "direct":
+        assert delivered == expected
+        assert not archives
+    else:
+        assert not delivered
+        assert len(archives) == 1
+        archive_type = pyzipper.AESZipFile if delivery == "encrypted" else ZipFile
+        password = b"test-password" if delivery == "encrypted" else None
+        with archive_type(str(archives[0])) as archive:
+            assert archive.namelist() == [name for name, _ in expected]
+            for name, payload in expected:
+                assert archive.read(name, pwd=password) == payload
+    api_base = proxy or "https://www.pixiv.net"
+    image_base = proxy or "https://i.pximg.net"
+    assert [url for url, _, _ in http.requests] == [
+        api_base + "/ajax/illust/123",
+        api_base + "/ajax/illust/123/pages",
+        image_base + template.format(0) + "?token=a%2Fb",
+        image_base + template.format(1) + "?token=a%2Fb",
+    ]
+    label = "原图" if image_size == "original" else image_size + " 像素预览图"
+    assert label in event.send.call_args.args[0].chain[0].text
+    assert not list((tmp_path / "temp").iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_size", ["1200", "540"])
+async def test_missing_preview_never_downloads_original(
+    plugin, event, http, tmp_path, image_size
+):
+    plugin.config["image_size"] = image_size
+    await plugin.pixiv(event, "123")
+    assert (
+        image_size + " 像素预览图地址缺失" in event.send.call_args.args[0].chain[0].text
+    )
+    assert len(http.requests) == 2
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [302, 403, 404])
+async def test_preview_download_failure_never_falls_back(
+    plugin, event, http, tmp_path, status
+):
+    plugin.config["image_size"] = "540"
+    http.routes["/ajax/illust/123/pages"] = web.json_response(
+        {
+            "body": [
+                {
+                    "urls": {
+                        "original": "https://i.pximg.net/images/123_p0.png",
+                        "small": "https://i.pximg.net/c/540x540_70/123_p0.jpg",
+                    }
+                }
+            ]
+        }
+    )
+    http.routes["/c/540x540_70/123_p0.jpg"] = web.Response(status=status)
+    await plugin.pixiv(event, "123")
+    assert "下载失败" in event.send.call_args.args[0].chain[0].text
+    assert len(http.requests) == 3
+    assert http.requests[-1][0] == "https://i.pximg.net/c/540x540_70/123_p0.jpg"
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_preview_url_host_is_validated(plugin, event, http, tmp_path):
+    plugin.config["image_size"] = "1200"
+    http.routes["/ajax/illust/123/pages"] = web.json_response(
+        {
+            "body": [
+                {
+                    "urls": {
+                        "regular": "https://other.example/123.jpg",
+                    }
+                }
+            ]
+        }
+    )
+    await plugin.pixiv(event, "123")
+    assert "不支持的1200 像素预览图地址" in event.send.call_args.args[0].chain[0].text
+    assert len(http.requests) == 2
+    assert not list((tmp_path / "saved").iterdir())

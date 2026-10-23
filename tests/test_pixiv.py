@@ -94,6 +94,7 @@ async def http(monkeypatch):
             "/images/123_p0.png": web.Response(body=PNG, content_type="image/png"),
         },
         requests=[],
+        received=[],
         allowed_hosts=None,
     )
 
@@ -106,6 +107,9 @@ async def http(monkeypatch):
         Returns:
             Configured response or a not-found response.
         """
+        state.received.append(
+            (request.path, dict(request.query), dict(request.headers))
+        )
         response = state.routes.get(request.path, web.Response(status=404))
         if callable(response):
             return await response(request)
@@ -179,9 +183,7 @@ async def test_complete_archive_and_cookie_isolation(
         body=b"second-original", content_type="image/jpeg"
     )
     if proxy:
-        http.allowed_hosts = {"images.example.com"}
-        for path in ("/ajax/illust/123", "/ajax/illust/123/pages"):
-            http.routes[prefix + path] = http.routes.pop(path)
+        http.allowed_hosts = {"www.pixiv.net", "images.example.com"}
     await plugin.pixiv(event, "00123")
 
     archives = list((tmp_path / "saved").glob("*.zip"))
@@ -203,16 +205,29 @@ async def test_complete_archive_and_cookie_isolation(
     assert not plugin._tasks
     assert len(http.requests) == 4
     for index, (_, options, jar) in enumerate(http.requests):
-        assert options["headers"]["Referer"] == "https://www.pixiv.net/"
+        expected_referer = (
+            "https://www.pixiv.net/artworks/123"
+            if index < 2
+            else "https://www.pixiv.net/"
+        )
+        assert options["headers"]["Referer"] == expected_referer
+        assert http.received[index][2]["Referer"] == expected_referer
+        assert "Firefox/" in http.received[index][2]["User-Agent"]
+        assert (
+            http.received[index][2]["Accept-Language"] == "zh-CN,zh;q=0.8,zh-TW;q=0.2"
+        )
         assert isinstance(jar, aiohttp.DummyCookieJar)
         assert options["allow_redirects"] is False
         if index < 2 and cookie:
             assert options["headers"]["Cookie"] == cookie
         else:
             assert "Cookie" not in options["headers"]
-    api_base = proxy.rstrip("/") if proxy else "https://www.pixiv.net"
-    assert http.requests[0][0] == api_base + "/ajax/illust/123"
-    assert http.requests[1][0] == api_base + "/ajax/illust/123/pages"
+    assert http.requests[0][0] == "https://www.pixiv.net/ajax/illust/123"
+    assert http.requests[1][0] == "https://www.pixiv.net/ajax/illust/123/pages"
+    assert http.received[0][1] == {}
+    assert http.received[1][1] == {"lang": "zh"}
+    assert http.received[0][2]["Accept"] == "application/json, text/plain, */*"
+    assert http.received[1][2]["Accept"] == "application/json, text/plain, */*"
     expected = proxy.rstrip("/") if proxy else "https://i.pximg.net"
     assert http.requests[2][0] == expected + "/images/123_p0.png?token=a%2Fb"
     assert http.requests[3][0] == expected + "/images/123_p1.jpg"
@@ -225,10 +240,10 @@ async def test_complete_archive_and_cookie_isolation(
     ("path", "request_count"),
     [("/ajax/illust/123", 1), ("/ajax/illust/123/pages", 2), ("/images/123_p0.png", 3)],
 )
-async def test_proxy_failure_never_redirects_or_falls_back(
+async def test_download_failure_never_redirects_or_switches_routes(
     plugin, event, http, tmp_path, status, path, request_count
 ):
-    """Keep every request on the Worker even when an upstream step fails.
+    """Keep artwork requests direct and images proxied when a download step fails.
 
     Args:
         plugin: Isolated downloader instance.
@@ -240,7 +255,7 @@ async def test_proxy_failure_never_redirects_or_falls_back(
         request_count: Number of requests before stopping.
     """
     plugin.config["image_proxy_base_url"] = "https://images.example.com/pximg"
-    http.allowed_hosts = {"images.example.com"}
+    http.allowed_hosts = {"www.pixiv.net", "images.example.com"}
     redirected = []
 
     async def redirect_target(request):
@@ -258,14 +273,74 @@ async def test_proxy_failure_never_redirects_or_falls_back(
     http.routes[path] = web.Response(
         status=status, headers={"Location": http.base_url + "/redirected"}
     )
-    http.routes = {"/pximg" + path: response for path, response in http.routes.items()}
+    http.routes = {
+        "/pximg" + path if path.startswith("/images/") else path: response
+        for path, response in http.routes.items()
+    }
     http.routes["/redirected"] = redirect_target
     await plugin.pixiv(event, "123")
     message = event.send.call_args.args[0].chain[0].text
     assert "跳转" in message if status == 302 else "HTTP 502" in message
     assert len(http.requests) == request_count
+    assert [url for url, _, _ in http.requests] == [
+        "https://www.pixiv.net/ajax/illust/123",
+        "https://www.pixiv.net/ajax/illust/123/pages",
+        "https://images.example.com/pximg/images/123_p0.png",
+    ][:request_count]
     assert all(options["allow_redirects"] is False for _, options, _ in http.requests)
     assert not redirected
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy", ["", "https://images.example.com/pximg"])
+@pytest.mark.parametrize("suffix", ["", "/pages"])
+@pytest.mark.parametrize("content_type", ["application/json", "text/html"])
+async def test_artwork_forbidden_reports_stage_without_logging_secrets(
+    plugin, event, http, tmp_path, proxy, suffix, content_type
+):
+    """Distinguish artwork access failures while keeping credentials out of logs.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting responses.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+        proxy: Optional Worker URL with a path prefix.
+        suffix: Artwork details or pages endpoint suffix.
+        content_type: JSON error or HTML block page returned by the endpoint.
+    """
+    plugin.config.update(
+        {"image_proxy_base_url": proxy, "pixiv_cookie": "PHPSESSID=request-secret"}
+    )
+    http.routes[f"/ajax/illust/123{suffix}"] = web.Response(
+        status=403,
+        text='{"message": "response-secret"}',
+        content_type=content_type,
+    )
+    http.allowed_hosts = {"www.pixiv.net"}
+    await plugin.pixiv(event, "123")
+
+    message = event.send.call_args.args[0].chain[0].text
+    assert "作品信息接口拒绝访问" in message
+    assert "HTTP 403" in message
+    assert ("非 JSON" in message) == (content_type != "application/json")
+    assert "直连" in message
+    assert "Worker 代理" not in message
+    assert "Cookie 是否有效" not in message
+    plugin.logger.warning.assert_called_once()
+    logged = plugin.logger.warning.call_args.args
+    assert logged[1:] == (
+        "123",
+        "pages" if suffix else "details",
+        "direct",
+        403,
+        content_type,
+    )
+    assert "request-secret" not in str(plugin.logger.mock_calls)
+    assert "response-secret" not in str(plugin.logger.mock_calls)
+    assert len(http.requests) == (2 if suffix else 1)
     assert not list((tmp_path / "saved").iterdir())
     assert not list((tmp_path / "temp").iterdir())
 
@@ -1132,10 +1207,9 @@ async def test_selected_image_size_for_all_delivery_modes(
         for index in range(2)
     ]
     prefix = "/pximg" if proxy else ""
-    http.routes[prefix + "/ajax/illust/123/pages"] = web.json_response({"body": pages})
+    http.routes["/ajax/illust/123/pages"] = web.json_response({"body": pages})
     if proxy:
-        http.allowed_hosts = {"images.example.com"}
-        http.routes[prefix + "/ajax/illust/123"] = http.routes.pop("/ajax/illust/123")
+        http.allowed_hosts = {"www.pixiv.net", "images.example.com"}
     for index in range(2):
         http.routes[prefix + template.format(index)] = web.Response(
             body=content + str(index).encode(),
@@ -1167,11 +1241,10 @@ async def test_selected_image_size_for_all_delivery_modes(
             assert archive.namelist() == [name for name, _ in expected]
             for name, payload in expected:
                 assert archive.read(name, pwd=password) == payload
-    api_base = proxy or "https://www.pixiv.net"
     image_base = proxy or "https://i.pximg.net"
     assert [url for url, _, _ in http.requests] == [
-        api_base + "/ajax/illust/123",
-        api_base + "/ajax/illust/123/pages",
+        "https://www.pixiv.net/ajax/illust/123",
+        "https://www.pixiv.net/ajax/illust/123/pages",
         image_base + template.format(0) + "?token=a%2Fb",
         image_base + template.format(1) + "?token=a%2Fb",
     ]

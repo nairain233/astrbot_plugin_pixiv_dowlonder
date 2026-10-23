@@ -266,7 +266,11 @@ class PixivDownloader(Star):
                     timeout=aiohttp.ClientTimeout(total=timeout),
                     cookie_jar=aiohttp.DummyCookieJar(),
                     headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; AstrBotPixiv/0.1.1)"
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) "
+                            "Gecko/20100101 Firefox/131.0"
+                        ),
+                        "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.2",
                     },
                 ) as session:
                     page_count = await self._download(
@@ -367,7 +371,7 @@ class PixivDownloader(Star):
         except asyncio.TimeoutError:
             await event.send(
                 event.plain_result(
-                    "下载失败：请求超时，请检查网络或 Worker 代理，或调大请求超时。"
+                    "下载失败：请求超时，请检查 Pixiv 直连、图片代理，或调大请求超时。"
                 )
             )
         except aiohttp.ClientError as exc:
@@ -376,7 +380,7 @@ class PixivDownloader(Star):
             )
             await event.send(
                 event.plain_result(
-                    "下载失败：网络请求异常，请检查配置的 Worker 代理；未配置代理时请检查 Pixiv 连通性。"
+                    "下载失败：网络请求异常，请检查 Pixiv 作品接口直连与图片下载地址的连通性。"
                 )
             )
         except (TypeError, ValueError):
@@ -453,8 +457,8 @@ class PixivDownloader(Star):
             session: HTTP session without shared authentication headers.
             pid: Validated numeric artwork ID.
             images: Empty directory belonging to this request.
-            cookie: Optional login cookie for AJAX requests, including via the proxy.
-            proxy: Optional base URL for all Pixiv requests, including any path prefix.
+            cookie: Optional login cookie sent only to the official AJAX API.
+            proxy: Optional image proxy base URL, including any path prefix.
             limit: Maximum cumulative number of downloaded image bytes.
             image_size: Original, 1200-pixel, or 540-pixel version to request.
 
@@ -465,23 +469,46 @@ class PixivDownloader(Star):
             PixivDownloadError: The work is inaccessible or an image is invalid.
             aiohttp.ClientError: An HTTP transport error occurs.
         """
-        headers = {"Referer": "https://www.pixiv.net/"}
+        headers = {
+            "Referer": f"https://www.pixiv.net/artworks/{pid}",
+            "Accept": "application/json, text/plain, */*",
+        }
         url_key, image_label = IMAGE_SIZES[image_size]
         if cookie:
             headers["Cookie"] = cookie
         pages = []
-        api_base = proxy or "https://www.pixiv.net"
         for suffix in ("", "/pages"):
             async with session.get(
-                f"{api_base}/ajax/illust/{pid}{suffix}",
+                f"https://www.pixiv.net/ajax/illust/{pid}{suffix}",
                 headers=headers,
+                params={"lang": "zh"} if suffix else None,
                 allow_redirects=False,
             ) as response:
+                if (
+                    response.status != 200
+                    or response.content_type != "application/json"
+                ):
+                    self.logger.warning(
+                        "Pixiv artwork request failed for PID %s endpoint=%s route=%s status=%s content_type=%s.",
+                        pid,
+                        "pages" if suffix else "details",
+                        "direct",
+                        response.status,
+                        response.content_type,
+                    )
                 if response.status == 429:
                     raise PixivDownloadError("Pixiv 请求过于频繁，请稍后重试。")
-                if response.status in {401, 403}:
+                if response.status == 401:
                     raise PixivDownloadError(
-                        "Pixiv 拒绝访问，请检查登录 Cookie 是否有效及账号是否有权查看作品。"
+                        "Pixiv 拒绝访问（HTTP 401），请检查登录 Cookie 是否有效。"
+                    )
+                if response.status == 403:
+                    if response.content_type != "application/json":
+                        raise PixivDownloadError(
+                            "Pixiv 作品信息接口拒绝访问（HTTP 403，直连返回非 JSON 内容）。请检查本机对 www.pixiv.net 的访问限制；图片代理不参与作品信息请求。"
+                        )
+                    raise PixivDownloadError(
+                        "Pixiv 作品信息接口拒绝访问（HTTP 403，直连）。请检查作品查看权限、登录状态及本机对 www.pixiv.net 的连通性。"
                     )
                 if response.status == 404:
                     raise PixivDownloadError("作品不存在、已删除或不可访问。")

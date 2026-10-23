@@ -4,13 +4,13 @@
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "填写浏览器访问 www.pixiv.net 时请求头中的 Cookie 值。仅用于作品信息请求；启用代理时会经配置的 Worker 转发给 Pixiv，请使用可信的 Worker。图片请求不携带 Cookie，配置以明文保存在本机。"
+    "hint": "填写浏览器访问 www.pixiv.net 时请求头中的 Cookie 值。仅直连发送到 Pixiv 官方作品信息接口，不发送给图片 Worker 或镜像。配置以明文保存在本机，请妥善保管。"
   },
   "image_proxy_base_url": {
-    "description": "Pixiv Worker 代理地址（可选）",
+    "description": "图片 Worker／镜像地址（可选）",
     "type": "string",
     "default": "",
-    "hint": "留空则直连 Pixiv 和图片服务器。填写后作品信息和原图全部经此地址访问，本机只需能连接 Worker 域名。支持 https://images.example.com 或带路径前缀的地址；Worker 须按 README 示例同时转发 /ajax/illust/ 作品接口和原图路径，旧版仅图片镜像需要升级。"
+    "hint": "留空则直连图片服务器；填写后仅图片下载经过此地址。支持 https://images.example.com 或 https://example.com/pximg，保留图片路径和查询参数。作品详情和分页信息始终直连 www.pixiv.net，本机须能访问 Pixiv 和图片 Worker 域名。"
   },
   "direct_send_max_pages": {
     "description": "直接发送页数上限",

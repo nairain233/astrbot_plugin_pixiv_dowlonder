@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from zipfile import ZipFile
 
 import aiohttp
+import botpy.message
 import pytest
 import pytest_asyncio
 import pyzipper
@@ -17,9 +18,22 @@ from aiohttp import web
 
 from astrbot.api.event import MessageChain, MessageEventResult
 from astrbot.api.message_components import File, Image
+from astrbot.api.platform import (
+    AstrBotMessage,
+    MessageMember,
+    MessageType,
+    PlatformMetadata,
+)
 from astrbot.core.message import components
+from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
+)
+from astrbot.core.platform.sources.qqofficial.qqofficial_message_event import (
+    QQOfficialMessageEvent,
+)
+from astrbot.core.platform.sources.qqofficial_webhook.qo_webhook_event import (
+    QQOfficialWebhookMessageEvent,
 )
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.permission import PermissionType, PermissionTypeFilter
@@ -926,12 +940,22 @@ async def test_later_page_failure_discards_earlier_image(plugin, event, http, tm
 
 
 @pytest.mark.asyncio
-async def test_upload_failure_preserves_archive(plugin, event, http, tmp_path):
+@pytest.mark.parametrize(
+    "platform", ["aiocqhttp", "qq_official", "qq_official_webhook"]
+)
+async def test_upload_failure_preserves_archive(
+    plugin, event, http, tmp_path, platform
+):
+    event.get_platform_name.return_value = platform
     event.send.side_effect = [None, RuntimeError("upload failed"), None]
     await plugin.pixiv(event, "123")
     archive = next((tmp_path / "saved").glob("*.zip"))
     assert str(archive) in event.send.call_args.args[0].chain[0].text
     assert "发送失败" in event.send.call_args.args[0].chain[0].text
+    text = event.send.call_args.args[0].chain[0].text
+    assert ("NapCat" in text) is (platform == "aiocqhttp")
+    if platform != "aiocqhttp":
+        assert "QQ 官方 Bot" in text
     assert not list((tmp_path / "temp").iterdir())
     assert ZipFile(archive).testzip() is None
 
@@ -1047,6 +1071,127 @@ async def test_unsupported_platform(plugin, event, http):
     await plugin.pixiv(event, "123")
     assert "仅支持 QQ" in event.send.call_args.args[0].chain[0].text
     assert not http.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform", "event_class"),
+    [
+        ("qq_official", QQOfficialMessageEvent),
+        ("qq_official_webhook", QQOfficialWebhookMessageEvent),
+    ],
+)
+@pytest.mark.parametrize("is_group", [False, True])
+@pytest.mark.parametrize("delivery", ["direct", "zip", "encrypted"])
+async def test_qqofficial_delivery(
+    plugin, http, tmp_path, monkeypatch, platform, event_class, is_group, delivery
+):
+    """Send local images and archives through real QQ Official event adapters.
+
+    Args:
+        plugin: Isolated downloader instance.
+        http: Local Pixiv and image service.
+        tmp_path: Per-test filesystem root.
+        monkeypatch: Pytest replacement manager.
+        platform: Official QQ adapter name.
+        event_class: WebSocket or Webhook message event class.
+        is_group: Whether to reply in a QQ group rather than C2C.
+        delivery: Direct images, plain ZIP, or encrypted ZIP.
+    """
+    plugin.config["direct_send_max_pages"] = 2 if delivery == "direct" else 0
+    if delivery == "encrypted":
+        plugin.config["zip_password"] = "qq-test-password"
+    http.routes["/ajax/illust/123/pages"] = web.json_response(
+        {
+            "body": [
+                {"urls": {"original": f"https://i.pximg.net/images/123_p{index}.png"}}
+                for index in range(2)
+            ]
+        }
+    )
+    http.routes["/images/123_p1.png"] = web.Response(body=PNG, content_type="image/png")
+    raw_class = botpy.message.GroupMessage if is_group else botpy.message.C2CMessage
+    raw = raw_class(
+        api=None,
+        event_id="event-1",
+        data={
+            "id": "msg-1",
+            "author": {"member_openid": "user-1", "user_openid": "user-1"},
+            "group_openid": "group-1",
+            "content": "/pixiv 123",
+            "timestamp": "0",
+        },
+    )
+    message = AstrBotMessage()
+    message.message_id = "msg-1"
+    message.session_id = "group-1" if is_group else "user-1"
+    message.group_id = "group-1" if is_group else ""
+    message.self_id = "bot-1"
+    message.sender = MessageMember(user_id="user-1", nickname="tester")
+    message.type = MessageType.GROUP_MESSAGE if is_group else MessageType.FRIEND_MESSAGE
+    message.message_str = "/pixiv 123"
+    message.message = []
+    message.raw_message = raw
+    sender = AsyncMock(return_value={"id": "reply-1"})
+    bot = SimpleNamespace(api=SimpleNamespace(post_group_message=sender))
+    event = event_class(
+        message.message_str,
+        message,
+        PlatformMetadata(name=platform, description="QQ Official", id="qq-test"),
+        message.session_id,
+        bot,
+    )
+    event.post_c2c_message = sender
+    monkeypatch.setattr(AstrMessageEvent, "send", AsyncMock())
+    uploaded = []
+
+    async def upload(source, file_type, **kwargs):
+        """Read media before the plugin removes temporary source files.
+
+        Args:
+            source: Base64 image or local archive path.
+            file_type: QQ media type.
+            **kwargs: Upload target and optional filename.
+
+        Returns:
+            Mock QQ upload response used by the real message sender.
+        """
+        assert kwargs["group_openid" if is_group else "openid"] == message.session_id
+        if file_type == 1:
+            assert base64.b64decode(source) == PNG
+        else:
+            assert file_type == 4
+            archive = Path(source)
+            assert archive.is_file()
+            assert kwargs["file_name"] == archive.name
+            with pyzipper.AESZipFile(archive) as packed:
+                if delivery == "encrypted":
+                    assert all(info.flag_bits & 1 for info in packed.infolist())
+                    packed.setpassword(b"qq-test-password")
+                assert packed.namelist() == ["123_p0.png", "123_p1.png"]
+                assert packed.read("123_p0.png") == PNG
+                assert packed.read("123_p1.png") == PNG
+        uploaded.append(file_type)
+        return {"file_info": "uploaded-media"}
+
+    event.upload_group_and_c2c_image = AsyncMock(side_effect=upload)
+    event.upload_group_and_c2c_media = AsyncMock(side_effect=upload)
+    await plugin.pixiv(event, "123")
+
+    assert uploaded == ([1, 1] if delivery == "direct" else [4])
+    calls = [call.kwargs for call in sender.await_args_list]
+    assert len(calls) == (4 if delivery == "direct" else 3)
+    assert all(call["msg_id"] == "msg-1" for call in calls)
+    assert all(
+        call["group_openid" if is_group else "openid"] == message.session_id
+        for call in calls
+    )
+    assert all(call["msg_type"] == 7 for call in calls[1:-1])
+    assert all(call["media"] == {"file_info": "uploaded-media"} for call in calls[1:-1])
+    assert not list((tmp_path / "temp").iterdir())
+    assert len(list((tmp_path / "saved").glob("*.zip"))) == (delivery != "direct")
+    assert not plugin._tasks
+    assert not plugin._active_archives
 
 
 @pytest.mark.asyncio
@@ -1185,9 +1330,13 @@ async def test_page_threshold_and_image_delivery(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failed_page", [1, 2])
+@pytest.mark.parametrize(
+    "platform", ["aiocqhttp", "qq_official", "qq_official_webhook"]
+)
 async def test_image_delivery_failure_stops_without_zip(
-    plugin, event, http, tmp_path, failed_page
+    plugin, event, http, tmp_path, failed_page, platform
 ):
+    event.get_platform_name.return_value = platform
     plugin.config["direct_send_max_pages"] = 3
     http.routes["/ajax/illust/123/pages"] = web.json_response(
         {
@@ -1218,6 +1367,9 @@ async def test_image_delivery_failure_stops_without_zip(
     text = event.send.call_args.args[0].chain[0].text
     assert f"第 {failed_page} 张图片发送失败" in text
     assert f"已发送 {failed_page - 1}/3 张" in text
+    assert ("NapCat" in text) is (platform == "aiocqhttp")
+    if platform != "aiocqhttp":
+        assert "QQ 官方 Bot" in text
     assert not list((tmp_path / "saved").iterdir())
     assert not list((tmp_path / "temp").iterdir())
     assert not plugin._tasks

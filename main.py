@@ -198,11 +198,17 @@ class PixivDownloader(Star):
                 event.plain_result("用法：/pixiv PID，例如 /pixiv 12345678")
             )
             return
-        if event.get_platform_name() != "aiocqhttp":
+        platform_name = event.get_platform_name()
+        if platform_name not in {"aiocqhttp", "qq_official", "qq_official_webhook"}:
             await event.send(
-                event.plain_result("此插件目前仅支持 QQ（NapCat / OneBot）。")
+                event.plain_result("此插件仅支持 QQ（NapCat / OneBot、QQ 官方 Bot）。")
             )
             return
+        upload_hint = (
+            "NapCat 的连接状态、文件权限和本地路径访问"
+            if platform_name == "aiocqhttp"
+            else "QQ 官方 Bot 的媒体上传权限、文件大小和平台限制"
+        )
         if self._stopping or len(self._tasks) >= 2:
             await event.send(event.plain_result("下载任务繁忙，请稍后重试。"))
             return
@@ -347,7 +353,7 @@ class PixivDownloader(Star):
                             )
                             await event.send(
                                 event.plain_result(
-                                    f"作品 {pid} 已下载，但第 {index} 张图片发送失败，已发送 {index - 1}/{page_count} 张。请检查 NapCat 状态，或将直接发送页数上限设为 0 后重试，改用 ZIP。"
+                                    f"作品 {pid} 已下载，但第 {index} 张图片发送失败，已发送 {index - 1}/{page_count} 张。请检查{upload_hint}，或将直接发送页数上限设为 0 后重试，改用 ZIP。"
                                 )
                             )
                             return
@@ -399,7 +405,7 @@ class PixivDownloader(Star):
                 )
                 await event.send(
                     event.plain_result(
-                        f"作品 {pid} 已下载，共 {page_count} 张，但 ZIP 发送失败。请检查 NapCat 的文件权限和本地路径访问。文件保留在：{archive}"
+                        f"作品 {pid} 已下载，共 {page_count} 张，但 ZIP 发送失败。请检查{upload_hint}。文件保留在：{archive}"
                     )
                 )
                 return

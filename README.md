@@ -1,6 +1,6 @@
 # Pixiv 图片打包下载器
 
-AstrBot 插件，通过 QQ（NapCat / OneBot、`aiocqhttp` 适配器）下载 Pixiv 插画或漫画的全部页面，可选原图或较小尺寸图片，按作品页数直接发送图片或打包 ZIP，发送到当前群聊或私聊。
+AstrBot 插件，通过 QQ（NapCat / OneBot、QQ 官方 Bot）下载 Pixiv 插画或漫画的全部页面，可选原图或较小尺寸图片，按作品页数直接发送图片或打包 ZIP，发送到当前群聊或私聊。支持 `aiocqhttp`、`qq_official`（WebSocket）及 `qq_official_webhook`（Webhook）适配器。
 
 ## 安装与使用
 
@@ -15,6 +15,12 @@ AstrBot 插件，通过 QQ（NapCat / OneBot、`aiocqhttp` 适配器）下载 Pi
 **健康模式默认开启**：作品详情标为 R-18（`xRestrict=1`）或 R-18G（`xRestrict=2`）时，立即提示拦截，不再请求分页或下载图片，也不发送图片和 ZIP。全年龄作品正常处理；分级缺失、类型异常或值未知时仍继续处理。此功能仅依据 Pixiv 的分级标记，不进行图片内容审核。可在插件配置中关闭“健康模式”恢复原有行为，群聊、私聊、直接发图及普通／加密 ZIP 均遵循同一开关。已有配置缺少此字段时也默认开启。
 
 默认不超过 **3 页**的作品直接按页序发送图片，**4 页及以上**打包发送 ZIP。在 WebUI 中修改“直接发送页数上限”即可调整分界，例如设为 `5` 时，1～5 页直接发送，6 页及以上打包；设为 `0` 则始终打包 ZIP。已有配置在重载插件后也会补入默认值 `3`。
+
+### QQ 官方 Bot
+
+在 AstrBot 中配置好 QQ 官方机器人（WebSocket 或 Webhook）后，重载本插件，在 QQ 群聊中 @机器人发送 `/pixiv PID`，或在 QQ 消息列表中私聊机器人发送该命令即可。插件无需填写 QQ AppID、AppSecret，也无需安装 NapCat，沿用同一套 Pixiv 下载、尺寸、健康模式和 ZIP 加密配置。
+
+图片和 ZIP 使用 AstrBot 的通用消息组件，由 QQ 官方适配器上传本地文件。需使用支持本地图片及文件上传的 AstrBot 版本，实际发送仍受 QQ 官方平台的权限、大小、频率及内容限制影响。发送失败时不会自动改用其他平台；ZIP 会保留在本地并回复路径。此处支持范围为 QQ 群聊和消息列表私聊，不包含 QQ 频道及频道私聊的 ZIP 发送。
 
 ## 配置
 
@@ -176,9 +182,9 @@ uv pip install --python ".venv/Scripts/python.exe" -r "data/plugins/astrbot_plug
 - 临时图片保存在 AstrBot 临时目录中，每次任务独立，任务完成、失败或正常卸载取消时清理。
 - 任意一页下载失败、返回非图片或超过大小上限时终止，不发送图片或生成缺图的 ZIP；已保存的完整 ZIP 默认保留，可使用下述手动或定时清理功能。
 - 最多同时处理两个任务，忙碌时提示稍后重试；每个任务按页顺序下载。
-- 文件发送失败时会回复保存路径，便于手工取用。上传大小、频率、群文件权限等限制取决于 QQ 和 NapCat，插件的下载上限不保证文件一定能上传。
+- 文件发送失败时会回复保存路径，便于手工取用。上传大小、频率、文件权限等限制取决于 QQ 及所用适配器，插件的下载上限不保证文件一定能上传。
 
-AstrBot 与 NapCat 需直接运行在同一 PC，使用同一套可读取的本地路径。ZIP 发送使用 AstrBot 的 `File` 消息组件；若后续改为 Docker 或跨机器部署，需要另行配置共享目录或文件访问方案。
+使用 NapCat / OneBot 时，AstrBot 与 NapCat 需直接运行在同一 PC，使用同一套可读取的本地路径。ZIP 发送使用 AstrBot 的 `File` 消息组件；若后续改为 Docker 或跨机器部署，需要另行配置共享目录或文件访问方案。QQ 官方 Bot 由 AstrBot 直接上传本地文件，不需要与 NapCat 共享目录。
 
 ## 一键清理与定时清理
 
@@ -207,4 +213,4 @@ uv run ruff format --check --no-respect-gitignore --config "exclude=[]" "data/pl
 uv run ruff check --no-respect-gitignore --config "exclude=[]" "data/plugins/astrbot_plugin_pixiv_dowlond"
 ```
 
-测试模拟 Pixiv 和图片服务，不需要真实 Cookie 或外网，覆盖两阶段直连／反代组合、同域与不同域反代、协议补全和兼容、端口和路径前缀、Cookie 隔离，以及失败不串用地址、不跟随重定向和不回退直连。实际验收还需在 NapCat 中分别验证群聊、私聊和已部署反代的完整下载；每个阶段只需能访问该阶段实际使用的官方接口或反代地址。Pixiv AJAX 属于网站接口，可能随网站变动，需要以实际访问结果为准。
+测试模拟 Pixiv 和图片服务，不需要真实 Cookie 或外网，覆盖两阶段直连／反代组合、同域与不同域反代、协议补全和兼容、端口和路径前缀、Cookie 隔离，以及失败不串用地址、不跟随重定向和不回退直连。QQ 官方适配测试覆盖 WebSocket／Webhook、群聊／私聊的图片及普通／加密 ZIP 发送链路，并模拟 QQ 上传和发送接口。实际验收还需在 NapCat 及 QQ 官方 Bot 中分别验证群聊、私聊和已部署反代的完整下载；每个阶段只需能访问该阶段实际使用的官方接口或反代地址。Pixiv AJAX 属于网站接口，可能随网站变动，需要以实际访问结果为准。

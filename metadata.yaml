@@ -6,3 +6,5 @@ author: 夜雨
 repo: https://github.com/nairain233/astrbot_plugin_pixiv_dowlonder
 support_platforms:
   - aiocqhttp
+  - qq_official
+  - qq_official_webhook

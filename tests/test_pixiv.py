@@ -296,6 +296,224 @@ async def test_complete_archive_and_cookie_isolation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_mode", [False, True], ids=["default", "enabled"])
+@pytest.mark.parametrize("rating", [1, 2], ids=["r18", "r18g"])
+@pytest.mark.parametrize("artwork_proxy", ["", "api.example.com/meta"])
+@pytest.mark.parametrize("delivery", ["direct", "zip", "encrypted"])
+async def test_healthy_mode_blocks_before_pages_and_images(
+    plugin,
+    event,
+    http,
+    tmp_path,
+    monkeypatch,
+    explicit_mode,
+    rating,
+    artwork_proxy,
+    delivery,
+):
+    """Block restricted works before any image or archive processing.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+        monkeypatch: Pytest replacement manager.
+        explicit_mode: Whether to set the enabled flag explicitly.
+        rating: Pixiv adult rating to block.
+        artwork_proxy: Optional artwork proxy with a path prefix.
+        delivery: Configured image or archive delivery mode.
+    """
+    plugin.config.update(
+        {
+            "artwork_proxy_base_url": artwork_proxy,
+            "image_proxy_base_url": "images.example.com/pximg",
+            "pixiv_cookie": "PHPSESSID=test-secret",
+            "direct_send_max_pages": 3 if delivery == "direct" else 0,
+            "zip_password": "test-password" if delivery == "encrypted" else "",
+        }
+    )
+    if explicit_mode:
+        plugin.config["healthy_mode"] = True
+    else:
+        assert "healthy_mode" not in plugin.config
+    api_base = (
+        "https://api.example.com/meta" if artwork_proxy else "https://www.pixiv.net"
+    )
+    prefix = "/meta" if artwork_proxy else ""
+    http.routes[prefix + "/ajax/illust/123"] = web.json_response(
+        {"body": {"illustType": 0, "xRestrict": rating}}
+    )
+    pack = MagicMock()
+    download = AsyncMock()
+    monkeypatch.setattr(plugin, "_pack_archive", pack)
+    monkeypatch.setattr(plugin, "_download", download)
+
+    await plugin.pixiv(event, "123")
+
+    rating_label = "R-18" if rating == 1 else "R-18G"
+    assert f"健康模式已开启，该作品属于 {rating_label}，已停止下载和发送。" in (
+        event.send.call_args.args[0].chain[0].text
+    )
+    assert [url for url, _, _ in http.requests] == [api_base + "/ajax/illust/123"]
+    assert not any(
+        isinstance(component, (File, Image))
+        for call in event.send.call_args_list
+        for component in call.args[0].chain
+    )
+    download.assert_not_awaited()
+    pack.assert_not_called()
+    plugin.logger.info.assert_called_once_with(
+        "Pixiv healthy mode blocked PID %s rating=%s route=%s.",
+        "123",
+        rating_label,
+        "proxy" if artwork_proxy else "direct",
+    )
+    assert "test-secret" not in str(plugin.logger.mock_calls)
+    assert "test-password" not in str(plugin.logger.mock_calls)
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._tasks
+    assert not plugin._active_archives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("artwork_proxy", ["", "api.example.com/meta"])
+@pytest.mark.parametrize(
+    "rating_data",
+    [
+        pytest.param({}, id="missing"),
+        *[
+            pytest.param({"xRestrict": rating}, id=name)
+            for name, rating in (
+                ("safe", 0),
+                ("null", None),
+                ("negative", -1),
+                ("unknown", 3),
+                ("string-r18", "1"),
+                ("string-r18g", "2"),
+                ("true", True),
+                ("false", False),
+                ("float-r18", 1.0),
+                ("float-r18g", 2.0),
+                ("list", [1]),
+                ("dict", {"value": 1}),
+            )
+        ],
+    ],
+)
+async def test_healthy_mode_allows_safe_or_unknown_rating(
+    plugin, event, http, tmp_path, artwork_proxy, rating_data
+):
+    """Allow safe or unrecognized metadata without treating it as an adult rating.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+        artwork_proxy: Optional artwork proxy with a path prefix.
+        rating_data: Safe, missing, or invalid rating metadata.
+    """
+    plugin.config.update(
+        {"healthy_mode": True, "artwork_proxy_base_url": artwork_proxy}
+    )
+    prefix = "/meta" if artwork_proxy else ""
+    http.routes[prefix + "/ajax/illust/123"] = web.json_response(
+        {"body": {"illustType": 0, **rating_data}}
+    )
+    http.routes[prefix + "/ajax/illust/123/pages"] = http.routes[
+        "/ajax/illust/123/pages"
+    ]
+
+    await plugin.pixiv(event, "123")
+
+    assert len(http.requests) == 3
+    archive_path = next((tmp_path / "saved").glob("*.zip"))
+    with ZipFile(archive_path) as archive:
+        assert archive.read("123_p0.png") == PNG
+    assert any(
+        isinstance(component, File)
+        for call in event.send.call_args_list
+        for component in call.args[0].chain
+    )
+    plugin.logger.info.assert_not_called()
+    assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rating", [1, 2])
+@pytest.mark.parametrize("artwork_proxy", ["", "api.example.com/meta"])
+@pytest.mark.parametrize("delivery", ["direct", "zip", "encrypted"])
+async def test_disabled_healthy_mode_preserves_delivery(
+    plugin, event, http, tmp_path, rating, artwork_proxy, delivery
+):
+    """Deliver adult-rated artwork normally when healthy mode is disabled.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+        rating: Pixiv adult rating allowed while filtering is disabled.
+        artwork_proxy: Optional artwork proxy with a path prefix.
+        delivery: Configured image or archive delivery mode.
+    """
+    plugin.config.update(
+        {
+            "healthy_mode": False,
+            "artwork_proxy_base_url": artwork_proxy,
+            "direct_send_max_pages": 3 if delivery == "direct" else 0,
+            "zip_password": "test-password" if delivery == "encrypted" else "",
+        }
+    )
+    prefix = "/meta" if artwork_proxy else ""
+    http.routes[prefix + "/ajax/illust/123"] = web.json_response(
+        {"body": {"illustType": 0, "xRestrict": rating}}
+    )
+    http.routes[prefix + "/ajax/illust/123/pages"] = http.routes[
+        "/ajax/illust/123/pages"
+    ]
+    delivered = []
+
+    async def receive(message):
+        """Capture directly sent image bytes before temporary files are removed.
+
+        Args:
+            message: Outbound message chain.
+        """
+        for component in message.chain:
+            if isinstance(component, Image):
+                delivered.append(Path(component.path).read_bytes())
+
+    event.send.side_effect = receive
+    await plugin.pixiv(event, "123")
+
+    assert len(http.requests) == 3
+    archives = list((tmp_path / "saved").glob("*.zip"))
+    if delivery == "direct":
+        assert delivered == [PNG]
+        assert not archives
+    else:
+        assert not delivered
+        assert len(archives) == 1
+        archive_type = pyzipper.AESZipFile if delivery == "encrypted" else ZipFile
+        password = b"test-password" if delivery == "encrypted" else None
+        with archive_type(str(archives[0])) as archive:
+            assert archive.read("123_p0.png", pwd=password) == PNG
+        assert any(
+            isinstance(component, File)
+            for call in event.send.call_args_list
+            for component in call.args[0].chain
+        )
+    plugin.logger.info.assert_not_called()
+    assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._tasks
+    assert not plugin._active_archives
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("artwork_proxy", ["", "api.example.com/meta"])
 @pytest.mark.parametrize("status", [302, 502])
 @pytest.mark.parametrize(
@@ -514,6 +732,10 @@ async def test_bad_pid_does_not_start_download(plugin, event, http, pid):
         ({"image_size": 540}, "图片尺寸必须选择"),
         ({"image_size": None}, "图片尺寸必须选择"),
         ({"image_size": []}, "图片尺寸必须选择"),
+        *[
+            ({"healthy_mode": value}, "健康模式必须是布尔值")
+            for value in (None, 0, 1, 1.0, "true", "false", [], {})
+        ],
     ],
 )
 async def test_invalid_config(plugin, event, http, config, message):

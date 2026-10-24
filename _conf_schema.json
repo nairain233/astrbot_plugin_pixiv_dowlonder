@@ -18,6 +18,12 @@
     "default": "",
     "hint": "留空直连图片服务器。填写 images.example.com 或 images.example.com/pximg 即可，省略协议默认 HTTPS，已有 http:// 或 https:// 地址仍可用，可带端口。仅用于图片下载，保留图片路径和查询参数，不携带 Cookie；作品解析由另一项配置独立控制。"
   },
+  "healthy_mode": {
+    "description": "健康模式",
+    "type": "bool",
+    "default": true,
+    "hint": "默认开启，依据 Pixiv 作品详情的分级标记拦截 R-18 和 R-18G，在请求分页和下载图片前停止，不发送图片或 ZIP。分级缺失、类型异常或未知时继续处理。仅依据平台标记判断，不进行图片内容审核；关闭后恢复原有下载与发送行为，对群聊和私聊均生效。"
+  },
   "direct_send_max_pages": {
     "description": "直接发送页数上限",
     "type": "int",

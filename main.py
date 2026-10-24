@@ -213,6 +213,9 @@ class PixivDownloader(Star):
         archive = None
         stage = "配置校验"
         try:
+            healthy_mode = self.config.get("healthy_mode", True)
+            if not isinstance(healthy_mode, bool):
+                raise PixivDownloadError("健康模式必须是布尔值，请检查插件配置。")
             timeout = float(self.config.get("request_timeout", 60))
             limit = float(self.config.get("max_download_mb", 200))
             if not 0 < timeout < float("inf") or not 0 < limit < float("inf"):
@@ -301,7 +304,11 @@ class PixivDownloader(Star):
                         else "作品解析（直连）"
                     )
                     pages = await self._resolve_pages(
-                        session, pid, cookie, proxies["artwork_proxy_base_url"]
+                        session,
+                        pid,
+                        cookie,
+                        proxies["artwork_proxy_base_url"],
+                        healthy_mode,
                     )
                     stage = (
                         "图片下载（反代）"
@@ -494,6 +501,7 @@ class PixivDownloader(Star):
         pid: str,
         cookie: str,
         artwork_proxy: str,
+        healthy_mode: bool,
     ) -> list[dict]:
         """Resolve a static artwork's page data independently of image downloads.
 
@@ -502,12 +510,13 @@ class PixivDownloader(Star):
             pid: Validated numeric artwork ID.
             cookie: Optional login cookie for official or proxied artwork requests.
             artwork_proxy: Normalized artwork proxy URL; empty selects Pixiv directly.
+            healthy_mode: Whether to block works marked R-18 or R-18G by Pixiv.
 
         Returns:
             Non-empty page data returned by the artwork pages endpoint.
 
         Raises:
-            PixivDownloadError: The work is inaccessible or page data is invalid.
+            PixivDownloadError: The work is blocked, inaccessible, or has invalid data.
             aiohttp.ClientError: An HTTP transport error occurs.
         """
         headers = {
@@ -579,6 +588,23 @@ class PixivDownloader(Star):
                     2,
                 }:
                     raise PixivDownloadError("Pixiv 作品详情格式异常，请稍后重试。")
+                rating = body.get("xRestrict")
+                if (
+                    healthy_mode
+                    and isinstance(rating, int)
+                    and not isinstance(rating, bool)
+                    and rating in {1, 2}
+                ):
+                    rating_label = "R-18" if rating == 1 else "R-18G"
+                    self.logger.info(
+                        "Pixiv healthy mode blocked PID %s rating=%s route=%s.",
+                        pid,
+                        rating_label,
+                        "proxy" if artwork_proxy else "direct",
+                    )
+                    raise PixivDownloadError(
+                        f"健康模式已开启，该作品属于 {rating_label}，已停止下载和发送。"
+                    )
                 if body["illustType"] == 2:
                     raise PixivDownloadError(
                         "暂不支持 Pixiv 动图（ugoira），请下载静态插画或漫画。"

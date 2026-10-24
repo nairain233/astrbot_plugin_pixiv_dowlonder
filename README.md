@@ -86,6 +86,8 @@ https://api.example.com/pixiv/ajax/illust/123/pages?lang=zh
 
 反代须去掉自己的路径前缀，将官方接口路径和查询参数转发到 `https://www.pixiv.net`，直接返回 JSON，不能跳转到其他地址。配置了 Cookie 时，这两个请求会携带 Cookie；下载图片时不携带。
 
+在境外服务器自建反代可参考 [Nginx 部署教程](doc/nginx-proxy.md)，包含仅代理作品信息、同一 Nginx 代理信息和图片、HTTPS、IP 白名单以及上游日志排查。教程也说明了此前 Worker 能下载图片但作品接口返回 403 的原因和判断边界。
+
 ### Worker 仅代理图片
 
 将 `image_proxy_base_url` 设为自己的图片 Worker 或反代地址，例如 `images.example.com`。图片下载仅连接该地址，无须本机直连 `i.pximg.net`；作品解析是否直连由另一项配置独立决定。下方精简 Worker 只向 `i.pximg.net` 转发，不支持作品解析，不能用作作品解析反代。

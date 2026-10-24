@@ -94,6 +94,8 @@ https://api.example.com/pixiv/ajax/illust/123/pages?lang=zh
 
 在境外服务器自建反代可参考 [Nginx 部署教程](doc/nginx-proxy.md)，包含仅代理作品信息、同一 Nginx 代理信息和图片、HTTPS、IP 白名单以及上游日志排查。教程也说明了此前 Worker 能下载图片但作品接口返回 403 的原因和判断边界。
 
+如果反代域名接入 Cloudflare，推荐开启橙云，使用 **Cloudflare 橙云代理 + Cloudflare WAF IP 白名单 + 源站防火墙**：WAF 只允许 AstrBot 的公网出口 IP，源站防火墙只允许 Cloudflare 回源，无需依赖 `X-Forwarded-For` 做访问控制。配置与验证步骤见教程的 [Cloudflare 橙云部署](doc/nginx-proxy.md#8-cloudflare-橙云部署推荐)。
+
 ### Worker 仅代理图片
 
 将 `image_proxy_base_url` 设为自己的图片 Worker 或反代地址，例如 `images.example.com`。图片下载仅连接该地址，无须本机直连 `i.pximg.net`；作品解析是否直连由另一项配置独立决定。下方精简 Worker 只向 `i.pximg.net` 转发，不支持作品解析，不能用作作品解析反代。

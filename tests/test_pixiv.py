@@ -127,7 +127,12 @@ async def http(monkeypatch):
         response = state.routes.get(request.path, web.Response(status=404))
         if callable(response):
             return await response(request)
-        return response
+        # A prepared aiohttp response cannot be reused across repeated requests.
+        return web.Response(
+            body=response.body,
+            status=response.status,
+            headers=response.headers.copy(),
+        )
 
     app = web.Application()
     app.router.add_route("*", "/{path:.*}", handle)
@@ -173,6 +178,48 @@ async def http(monkeypatch):
     [
         ("", "", "https://www.pixiv.net", "https://i.pximg.net"),
         ("api.example.com", "", "https://api.example.com", "https://i.pximg.net"),
+        (
+            "100.101.102.103:8080/pixiv",
+            "100.101.102.103:8080/pximg",
+            "http://100.101.102.103:8080/pixiv",
+            "http://100.101.102.103:8080/pximg",
+        ),
+        (
+            "100.101.102.103:8080",
+            "",
+            "http://100.101.102.103:8080",
+            "https://i.pximg.net",
+        ),
+        (
+            "",
+            " 100.101.102.103:8080/pximg/ ",
+            "https://www.pixiv.net",
+            "http://100.101.102.103:8080/pximg",
+        ),
+        (
+            "100.101.102.103",
+            "192.168.1.10:8000",
+            "http://100.101.102.103",
+            "http://192.168.1.10:8000",
+        ),
+        (
+            "[fd7a:115c:a1e0::1234]:8080/pixiv",
+            "[fd7a:115c:a1e0::1234]:8080/pximg",
+            "http://[fd7a:115c:a1e0::1234]:8080/pixiv",
+            "http://[fd7a:115c:a1e0::1234]:8080/pximg",
+        ),
+        (
+            "https://100.101.102.103:8443/pixiv",
+            "https://[fd7a:115c:a1e0::1234]:8443/pximg",
+            "https://100.101.102.103:8443/pixiv",
+            "https://[fd7a:115c:a1e0::1234]:8443/pximg",
+        ),
+        (
+            "http://100.101.102.103:8080/pixiv",
+            "http://[fd7a:115c:a1e0::1234]:8080/pximg",
+            "http://100.101.102.103:8080/pixiv",
+            "http://[fd7a:115c:a1e0::1234]:8080/pximg",
+        ),
         (
             "",
             "images.example.com",
@@ -307,6 +354,192 @@ async def test_complete_archive_and_cookie_isolation(
     assert http.requests[3][0] == image_base + "/images/123_p1.jpg"
     assert plugin.config == original_config
     assert "test-secret" not in str(plugin.logger.mock_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed, expected_requests", [(599, 4), (600, 6)])
+async def test_metadata_cache_expiry(
+    plugin, event, http, tmp_path, monkeypatch, elapsed, expected_requests
+):
+    """Reuse metadata for ten minutes while always downloading fresh image bytes.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+        monkeypatch: Pytest replacement manager.
+        elapsed: Seconds elapsed since successful metadata resolution.
+        expected_requests: Total artwork and image requests across both commands.
+    """
+    clock = SimpleNamespace(value=1000)
+    monkeypatch.setattr(
+        plugin_module, "time", SimpleNamespace(monotonic=lambda: clock.value)
+    )
+    await plugin.pixiv(event, "123")
+    clock.value += elapsed
+    await plugin.pixiv(event, "00123")
+    assert len(http.requests) == expected_requests
+    assert sum("/images/" in url for url, _, _ in http.requests) == 2
+    assert len(plugin._metadata_cache) == 1
+    assert len(list((tmp_path / "saved").glob("*.zip"))) == 2
+    assert "下载失败" not in str(event.send.call_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["pid", "cookie", "artwork_proxy"])
+async def test_metadata_cache_isolates_request_context(plugin, event, http, changed):
+    """Resolve separately when artwork identity, credentials, or API origin changes.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+        changed: Request context that must prevent a cache hit.
+    """
+    await plugin.pixiv(event, "123")
+    pid = "123"
+    if changed == "pid":
+        pid = "456"
+        http.routes["/ajax/illust/456"] = http.routes["/ajax/illust/123"]
+        http.routes["/ajax/illust/456/pages"] = http.routes["/ajax/illust/123/pages"]
+    elif changed == "cookie":
+        plugin.config["pixiv_cookie"] = "PHPSESSID=cache-test-secret"
+    else:
+        plugin.config["artwork_proxy_base_url"] = "100.101.102.103:8080/pixiv"
+        http.routes["/pixiv/ajax/illust/123"] = http.routes["/ajax/illust/123"]
+        http.routes["/pixiv/ajax/illust/123/pages"] = http.routes[
+            "/ajax/illust/123/pages"
+        ]
+    await plugin.pixiv(event, pid)
+    assert len(http.requests) == 6
+    assert len(plugin._metadata_cache) == 2
+    assert "cache-test-secret" not in repr(plugin._metadata_cache)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rating", [1, 2])
+async def test_cached_adult_metadata_cannot_bypass_healthy_mode(
+    plugin, event, http, rating
+):
+    """Recheck the adult rating after healthy mode is enabled.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+        rating: Adult classification cached while filtering was disabled.
+    """
+    http.routes["/ajax/illust/123"] = web.json_response(
+        {"body": {"illustType": 0, "xRestrict": rating}}
+    )
+    plugin.config["healthy_mode"] = False
+    await plugin.pixiv(event, "123")
+    assert len(plugin._metadata_cache) == 1
+    event.send.reset_mock()
+    plugin.config["healthy_mode"] = True
+    await plugin.pixiv(event, "123")
+    assert len(http.requests) == 4
+    assert "健康模式已开启" in event.send.call_args.args[0].chain[0].text
+    assert not any(
+        isinstance(component, (File, Image))
+        for call in event.send.call_args_list
+        for component in call.args[0].chain
+    )
+
+
+@pytest.mark.asyncio
+async def test_image_proxy_changes_reuse_metadata(plugin, event, http):
+    """Keep the independent image route outside the artwork metadata cache key.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+    """
+    await plugin.pixiv(event, "123")
+    plugin.config["image_proxy_base_url"] = "100.101.102.103:8080/pximg"
+    http.routes["/pximg/images/123_p0.png"] = http.routes["/images/123_p0.png"]
+    await plugin.pixiv(event, "123")
+    assert len(http.requests) == 4
+    assert http.requests[-1][0] == "http://100.101.102.103:8080/pximg/images/123_p0.png"
+    assert "Cookie" not in http.received[-1][2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/ajax/illust/123", "/ajax/illust/123/pages"])
+@pytest.mark.parametrize("failure", [403, 429, "timeout"])
+async def test_failed_metadata_is_not_cached(
+    plugin, event, http, tmp_path, path, failure
+):
+    """End failed requests promptly and retry metadata normally on the next command.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+        path: Detail or pagination endpoint that fails.
+        failure: HTTP restriction status or a simulated slow upstream.
+    """
+    successful_response = http.routes[path]
+    if failure == "timeout":
+        plugin.config["request_timeout"] = 0.05
+
+        async def slow_response(request):
+            """Simulate an upstream that cannot respond within the request timeout.
+
+            Args:
+                request: Local HTTP request.
+
+            Returns:
+                Successful metadata after the client timeout has elapsed.
+            """
+            await asyncio.sleep(0.15)
+            return successful_response
+
+        http.routes[path] = slow_response
+    else:
+        http.routes[path] = web.Response(status=failure)
+    await asyncio.wait_for(plugin.pixiv(event, "123"), timeout=2)
+    assert not plugin._metadata_cache
+    assert not plugin._tasks
+    assert not list((tmp_path / "temp").iterdir())
+    message = event.send.call_args.args[0].chain[0].text
+    assert "作品解析（直连）" in message
+    assert {
+        403: "拒绝访问",
+        429: "过于频繁",
+        "timeout": "请求超时",
+    }[failure] in message
+    http.routes[path] = successful_response
+    plugin.config["request_timeout"] = 60
+    await plugin.pixiv(event, "123")
+    assert len(plugin._metadata_cache) == 1
+    assert list((tmp_path / "saved").glob("*.zip"))
+
+
+@pytest.mark.asyncio
+async def test_metadata_cache_has_a_size_bound_and_clears_on_unload(
+    plugin, event, http
+):
+    """Limit retained metadata and release it when the plugin is unloaded.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+    """
+    for index in range(33):
+        plugin.config["pixiv_cookie"] = f"session={index}"
+        await plugin.pixiv(event, "123")
+    assert len(plugin._metadata_cache) == 32
+    plugin.config["pixiv_cookie"] = "session=0"
+    await plugin.pixiv(event, "123")
+    assert len(http.requests) == 34 * 3
+    assert len(plugin._metadata_cache) == 32
+    await plugin.terminate()
+    assert not plugin._metadata_cache
 
 
 @pytest.mark.asyncio
@@ -784,6 +1017,12 @@ async def test_invalid_config(plugin, event, http, config, message):
         "example .com",
         "example.com\n/path",
         "https://[::1",
+        "100.101.102.103:bad",
+        "100.101.102.103:65536",
+        "100.101.102.103:0",
+        "100.101.102.103:",
+        "[fd7a:115c:a1e0::1234]:bad",
+        "fd7a:115c:a1e0::1234:8080",
     ],
 )
 async def test_invalid_proxy_address_stops_before_requests(
@@ -1004,6 +1243,49 @@ async def test_stage_network_failure_reports_route(
     assert "exception-secret" not in str(plugin.logger.mock_calls)
     assert "exception-secret" not in message
     assert not list((tmp_path / "temp").iterdir())
+    assert not plugin._tasks
+
+
+@pytest.mark.asyncio
+async def test_only_two_artwork_resolutions_can_run_at_once(plugin, event, http):
+    """Reject a third command while two real artwork requests are still pending.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting outbound messages.
+        http: Local HTTP routes and request log.
+    """
+    entered = asyncio.Queue()
+    release = asyncio.Event()
+
+    async def pending_details(request):
+        """Hold the artwork response until both allowed commands have connected.
+
+        Args:
+            request: Local HTTP request.
+
+        Returns:
+            A valid unrestricted artwork response after release.
+        """
+        await entered.put(request.path)
+        await release.wait()
+        return web.json_response({"body": {"illustType": 0, "xRestrict": 0}})
+
+    for pid in ("123", "456"):
+        http.routes[f"/ajax/illust/{pid}"] = pending_details
+        http.routes[f"/ajax/illust/{pid}/pages"] = http.routes["/ajax/illust/123/pages"]
+    first = asyncio.create_task(plugin.pixiv(event, "123"))
+    second = asyncio.create_task(plugin.pixiv(event, "456"))
+    try:
+        await asyncio.wait_for(entered.get(), 2)
+        await asyncio.wait_for(entered.get(), 2)
+        await asyncio.wait_for(plugin.pixiv(event, "789"), 1)
+        assert "繁忙" in event.send.call_args.args[0].chain[0].text
+        assert len(http.requests) == 2
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+    assert len(http.requests) == 6
     assert not plugin._tasks
 
 

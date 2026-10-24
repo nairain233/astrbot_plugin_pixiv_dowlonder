@@ -10,13 +10,13 @@
     "description": "作品解析反代地址（可选）",
     "type": "string",
     "default": "",
-    "hint": "留空直连 www.pixiv.net。填写 api.example.com 或 api.example.com/pixiv 即可，省略协议默认 HTTPS，已有 http:// 或 https:// 地址仍可用。反代须支持 Pixiv 的 /ajax/illust/ 详情和分页接口，返回官方 JSON；与图片下载反代独立，配置 Cookie 时会经此地址转发。"
+    "hint": "留空直连 www.pixiv.net。支持域名、IP:端口及路径前缀，如 api.example.com/pixiv 或 100.101.102.103:8080/pixiv。省略协议时域名默认 HTTPS，IPv4／方括号 IPv6 地址默认 HTTP；显式 http:// 或 https:// 保持不变。反代须支持官方 /ajax/illust/ JSON；配置 Cookie 时会经此地址转发，请使用可信服务。"
   },
   "image_proxy_base_url": {
     "description": "图片下载反代地址（可选）",
     "type": "string",
     "default": "",
-    "hint": "留空直连图片服务器。填写 images.example.com 或 images.example.com/pximg 即可，省略协议默认 HTTPS，已有 http:// 或 https:// 地址仍可用，可带端口。仅用于图片下载，保留图片路径和查询参数，不携带 Cookie；作品解析由另一项配置独立控制。"
+    "hint": "留空直连图片服务器。支持域名、IP:端口及路径前缀，如 images.example.com/pximg 或 100.101.102.103:8080/pximg。省略协议时域名默认 HTTPS，IPv4／方括号 IPv6 地址默认 HTTP；显式 http:// 或 https:// 保持不变。仅下载图片，保留路径和查询参数，不携带 Cookie，与作品解析反代独立。"
   },
   "healthy_mode": {
     "description": "健康模式",

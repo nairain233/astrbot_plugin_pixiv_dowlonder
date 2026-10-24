@@ -4,6 +4,8 @@
 
 **如果域名接入 Cloudflare，推荐开启橙云，使用「Cloudflare 橙云代理 + Cloudflare WAF IP 白名单 + 源站防火墙」**：WAF 按 AstrBot 的真实出口 IP 限制访问，源站防火墙只允许 Cloudflare 回源。无需在 Nginx 中依赖 `X-Forwarded-For` 恢复客户端 IP 来做访问控制，具体配置见[第 8 节](#8-cloudflare-橙云部署推荐)。
 
+本教程用于公网 HTTPS，由 Nginx 直接转发 Pixiv，不需要另设 FastAPI。若通过 Tailscale IP 和端口访问，使用 [Tailscale + FastAPI 内网教程](tailscale.md)，直接运行绑定 Tailscale 地址的 FastAPI HTTP 服务，无需 Nginx。两套方案沿用相同的 `/pixiv`、`/pximg` 插件路径。
+
 ## 1. 为什么没有继续用一个 Worker 代理全部请求
 
 插件需要访问两个不同的上游：

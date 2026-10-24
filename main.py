@@ -5,6 +5,8 @@ import stat
 import tempfile
 import time
 from datetime import datetime
+from hashlib import sha256
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -49,6 +51,9 @@ class PixivDownloader(Star):
         self.config = config
         self._tasks: set[asyncio.Task] = set()
         self._active_archives: set[Path] = set()
+        self._metadata_cache: dict[
+            tuple[str, str, bytes, bool], tuple[float, list[dict]]
+        ] = {}
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
         self._stopping = False
@@ -252,7 +257,8 @@ class PixivDownloader(Star):
                     raise PixivDownloadError(f"{label}必须是字符串。")
                 proxy = value.strip().rstrip("/")
                 if proxy:
-                    if "://" not in proxy:
+                    has_scheme = "://" in proxy
+                    if not has_scheme:
                         proxy = f"https://{proxy}"
                     try:
                         parsed = urlsplit(proxy)
@@ -276,6 +282,15 @@ class PixivDownloader(Star):
                         raise PixivDownloadError(
                             f"{label}应为 HTTP(S) 地址，可省略协议，可含路径前缀，不能含账号、查询参数或片段。"
                         )
+                    if not has_scheme:
+                        try:
+                            ip_address(parsed.hostname)
+                        except ValueError:
+                            pass
+                        else:
+                            proxy = urlunsplit(
+                                ("http", parsed.netloc, parsed.path, "", "")
+                            )
                 proxies[key] = proxy
             cookie = str(self.config.get("pixiv_cookie", "")).strip()
             if "\r" in cookie or "\n" in cookie:
@@ -309,13 +324,30 @@ class PixivDownloader(Star):
                         if proxies["artwork_proxy_base_url"]
                         else "作品解析（直连）"
                     )
-                    pages = await self._resolve_pages(
-                        session,
+                    now = time.monotonic()
+                    self._metadata_cache = {
+                        key: value
+                        for key, value in self._metadata_cache.items()
+                        if value[0] > now
+                    }
+                    cache_key = (
                         pid,
-                        cookie,
                         proxies["artwork_proxy_base_url"],
+                        sha256(cookie.encode("utf-8")).digest(),
                         healthy_mode,
                     )
+                    cached = self._metadata_cache.get(cache_key)
+                    if cached is not None:
+                        pages = cached[1]
+                    else:
+                        pages = await self._resolve_pages(
+                            session,
+                            pid,
+                            cookie,
+                            proxies["artwork_proxy_base_url"],
+                            healthy_mode,
+                        )
+                        metadata_expires = time.monotonic() + 600
                     stage = (
                         "图片下载（反代）"
                         if proxies["image_proxy_base_url"]
@@ -330,6 +362,11 @@ class PixivDownloader(Star):
                         int(limit * 1024 * 1024),
                         image_size,
                     )
+                    if cached is None:
+                        # Cache successful results without retaining malformed image URLs.
+                        if len(self._metadata_cache) >= 32:
+                            self._metadata_cache.pop(next(iter(self._metadata_cache)))
+                        self._metadata_cache[cache_key] = (metadata_expires, pages)
 
                 stage = "文件处理"
                 if 0 < page_count <= direct_pages:
@@ -737,5 +774,6 @@ class PixivDownloader(Star):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._metadata_cache.clear()
         async with self._cleanup_lock:
             pass

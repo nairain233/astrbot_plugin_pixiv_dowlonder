@@ -155,15 +155,75 @@ async def http(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "proxy", ["", "https://images.example.com", "https://images.example.com/pximg/"]
+    ("artwork_proxy", "image_proxy", "api_base", "image_base"),
+    [
+        ("", "", "https://www.pixiv.net", "https://i.pximg.net"),
+        ("api.example.com", "", "https://api.example.com", "https://i.pximg.net"),
+        (
+            "",
+            "images.example.com",
+            "https://www.pixiv.net",
+            "https://images.example.com",
+        ),
+        (
+            " api.example.com:8443/pixiv/ ",
+            " images.example.com:9443/pximg/ ",
+            "https://api.example.com:8443/pixiv",
+            "https://images.example.com:9443/pximg",
+        ),
+        (
+            "proxy.example.com/bridge",
+            "proxy.example.com/bridge",
+            "https://proxy.example.com/bridge",
+            "https://proxy.example.com/bridge",
+        ),
+        (
+            "https://api.example.com/meta/",
+            "https://images.example.com/pximg/",
+            "https://api.example.com/meta",
+            "https://images.example.com/pximg",
+        ),
+        (
+            "http://api.example.com:8080/meta/",
+            "http://images.example.com:8081/pximg/",
+            "http://api.example.com:8080/meta",
+            "http://images.example.com:8081/pximg",
+        ),
+        (
+            "",
+            "https://images.example.com/pximg/",
+            "https://www.pixiv.net",
+            "https://images.example.com/pximg",
+        ),
+    ],
 )
 @pytest.mark.parametrize("cookie", ["", "PHPSESSID=test-secret"])
 async def test_complete_archive_and_cookie_isolation(
-    plugin, event, http, tmp_path, proxy, cookie
+    plugin,
+    event,
+    http,
+    tmp_path,
+    artwork_proxy,
+    image_proxy,
+    api_base,
+    image_base,
+    cookie,
 ):
-    plugin.config.update({"pixiv_cookie": cookie, "image_proxy_base_url": proxy})
-    prefix = "/pximg" if proxy.endswith("/pximg/") else ""
-    http.routes["/ajax/illust/123/pages"] = web.json_response(
+    plugin.config.update(
+        {
+            "pixiv_cookie": cookie,
+            "artwork_proxy_base_url": artwork_proxy,
+            "image_proxy_base_url": image_proxy,
+        }
+    )
+    original_config = dict(plugin.config)
+    api_prefix = urlsplit(api_base).path
+    image_prefix = urlsplit(image_base).path
+    http.routes[api_prefix + "/ajax/illust/123"] = web.json_response(
+        {"error": False, "body": {"illustType": 0}},
+        headers={"Set-Cookie": "unexpected=artwork-secret"},
+    )
+    http.routes[api_prefix + "/ajax/illust/123/pages"] = web.json_response(
         {
             "error": False,
             "body": [
@@ -176,14 +236,13 @@ async def test_complete_archive_and_cookie_isolation(
             ],
         }
     )
-    http.routes[f"{prefix}/images/123_p0.png"] = web.Response(
+    http.routes[f"{image_prefix}/images/123_p0.png"] = web.Response(
         body=PNG, content_type="image/png", headers={"Set-Cookie": "unexpected=secret"}
     )
-    http.routes[f"{prefix}/images/123_p1.jpg"] = web.Response(
+    http.routes[f"{image_prefix}/images/123_p1.jpg"] = web.Response(
         body=b"second-original", content_type="image/jpeg"
     )
-    if proxy:
-        http.allowed_hosts = {"www.pixiv.net", "images.example.com"}
+    http.allowed_hosts = {urlsplit(api_base).hostname, urlsplit(image_base).hostname}
     await plugin.pixiv(event, "00123")
 
     archives = list((tmp_path / "saved").glob("*.zip"))
@@ -220,42 +279,51 @@ async def test_complete_archive_and_cookie_isolation(
         assert options["allow_redirects"] is False
         if index < 2 and cookie:
             assert options["headers"]["Cookie"] == cookie
+            assert http.received[index][2]["Cookie"] == cookie
         else:
             assert "Cookie" not in options["headers"]
-    assert http.requests[0][0] == "https://www.pixiv.net/ajax/illust/123"
-    assert http.requests[1][0] == "https://www.pixiv.net/ajax/illust/123/pages"
+            assert "Cookie" not in http.received[index][2]
+    assert http.requests[0][0] == api_base + "/ajax/illust/123"
+    assert http.requests[1][0] == api_base + "/ajax/illust/123/pages"
     assert http.received[0][1] == {}
     assert http.received[1][1] == {"lang": "zh"}
     assert http.received[0][2]["Accept"] == "application/json, text/plain, */*"
     assert http.received[1][2]["Accept"] == "application/json, text/plain, */*"
-    expected = proxy.rstrip("/") if proxy else "https://i.pximg.net"
-    assert http.requests[2][0] == expected + "/images/123_p0.png?token=a%2Fb"
-    assert http.requests[3][0] == expected + "/images/123_p1.jpg"
+    assert http.requests[2][0] == image_base + "/images/123_p0.png?token=a%2Fb"
+    assert http.requests[3][0] == image_base + "/images/123_p1.jpg"
+    assert plugin.config == original_config
     assert "test-secret" not in str(plugin.logger.mock_calls)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("artwork_proxy", ["", "api.example.com/meta"])
 @pytest.mark.parametrize("status", [302, 502])
 @pytest.mark.parametrize(
     ("path", "request_count"),
     [("/ajax/illust/123", 1), ("/ajax/illust/123/pages", 2), ("/images/123_p0.png", 3)],
 )
 async def test_download_failure_never_redirects_or_switches_routes(
-    plugin, event, http, tmp_path, status, path, request_count
+    plugin, event, http, tmp_path, artwork_proxy, status, path, request_count
 ):
-    """Keep artwork requests direct and images proxied when a download step fails.
+    """Keep each stage on its configured route when a download step fails.
 
     Args:
         plugin: Isolated downloader instance.
         event: Message event collecting responses.
         http: Local HTTP routes and request log.
         tmp_path: Per-test filesystem root.
+        artwork_proxy: Optional independent artwork proxy address.
         status: Proxy failure or redirect response status.
         path: Artwork or image endpoint that fails.
         request_count: Number of requests before stopping.
     """
     plugin.config["image_proxy_base_url"] = "https://images.example.com/pximg"
-    http.allowed_hosts = {"www.pixiv.net", "images.example.com"}
+    plugin.config["artwork_proxy_base_url"] = artwork_proxy
+    api_base = (
+        "https://api.example.com/meta" if artwork_proxy else "https://www.pixiv.net"
+    )
+    api_prefix = "/meta" if artwork_proxy else ""
+    http.allowed_hosts = {urlsplit(api_base).hostname, "images.example.com"}
     redirected = []
 
     async def redirect_target(request):
@@ -274,7 +342,7 @@ async def test_download_failure_never_redirects_or_switches_routes(
         status=status, headers={"Location": http.base_url + "/redirected"}
     )
     http.routes = {
-        "/pximg" + path if path.startswith("/images/") else path: response
+        ("/pximg" if path.startswith("/images/") else api_prefix) + path: response
         for path, response in http.routes.items()
     }
     http.routes["/redirected"] = redirect_target
@@ -283,8 +351,8 @@ async def test_download_failure_never_redirects_or_switches_routes(
     assert "跳转" in message if status == 302 else "HTTP 502" in message
     assert len(http.requests) == request_count
     assert [url for url, _, _ in http.requests] == [
-        "https://www.pixiv.net/ajax/illust/123",
-        "https://www.pixiv.net/ajax/illust/123/pages",
+        api_base + "/ajax/illust/123",
+        api_base + "/ajax/illust/123/pages",
         "https://images.example.com/pximg/images/123_p0.png",
     ][:request_count]
     assert all(options["allow_redirects"] is False for _, options, _ in http.requests)
@@ -294,11 +362,12 @@ async def test_download_failure_never_redirects_or_switches_routes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("artwork_proxy", ["", "api.example.com/meta"])
 @pytest.mark.parametrize("proxy", ["", "https://images.example.com/pximg"])
 @pytest.mark.parametrize("suffix", ["", "/pages"])
 @pytest.mark.parametrize("content_type", ["application/json", "text/html"])
 async def test_artwork_forbidden_reports_stage_without_logging_secrets(
-    plugin, event, http, tmp_path, proxy, suffix, content_type
+    plugin, event, http, tmp_path, artwork_proxy, proxy, suffix, content_type
 ):
     """Distinguish artwork access failures while keeping credentials out of logs.
 
@@ -307,26 +376,36 @@ async def test_artwork_forbidden_reports_stage_without_logging_secrets(
         event: Message event collecting responses.
         http: Local HTTP routes and request log.
         tmp_path: Per-test filesystem root.
+        artwork_proxy: Optional independent artwork proxy address.
         proxy: Optional Worker URL with a path prefix.
         suffix: Artwork details or pages endpoint suffix.
         content_type: JSON error or HTML block page returned by the endpoint.
     """
     plugin.config.update(
-        {"image_proxy_base_url": proxy, "pixiv_cookie": "PHPSESSID=request-secret"}
+        {
+            "artwork_proxy_base_url": artwork_proxy,
+            "image_proxy_base_url": proxy,
+            "pixiv_cookie": "PHPSESSID=request-secret",
+        }
     )
     http.routes[f"/ajax/illust/123{suffix}"] = web.Response(
         status=403,
         text='{"message": "response-secret"}',
         content_type=content_type,
     )
-    http.allowed_hosts = {"www.pixiv.net"}
+    api_prefix = "/meta" if artwork_proxy else ""
+    if artwork_proxy:
+        http.routes = {
+            api_prefix + path: response for path, response in http.routes.items()
+        }
+    http.allowed_hosts = {"api.example.com" if artwork_proxy else "www.pixiv.net"}
     await plugin.pixiv(event, "123")
 
     message = event.send.call_args.args[0].chain[0].text
     assert "作品信息接口拒绝访问" in message
     assert "HTTP 403" in message
     assert ("非 JSON" in message) == (content_type != "application/json")
-    assert "直连" in message
+    assert ("反代" if artwork_proxy else "直连") in message
     assert "Worker 代理" not in message
     assert "Cookie 是否有效" not in message
     plugin.logger.warning.assert_called_once()
@@ -334,13 +413,52 @@ async def test_artwork_forbidden_reports_stage_without_logging_secrets(
     assert logged[1:] == (
         "123",
         "pages" if suffix else "details",
-        "direct",
+        "proxy" if artwork_proxy else "direct",
         403,
         content_type,
     )
     assert "request-secret" not in str(plugin.logger.mock_calls)
     assert "response-secret" not in str(plugin.logger.mock_calls)
     assert len(http.requests) == (2 if suffix else 1)
+    assert not list((tmp_path / "saved").iterdir())
+    assert not list((tmp_path / "temp").iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("artwork_proxy", ["", "api.example.com/meta"])
+async def test_artwork_invalid_json_reports_route(
+    plugin, event, http, tmp_path, artwork_proxy
+):
+    """Keep malformed artwork JSON failures in the resolution stage.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting responses.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+        artwork_proxy: Optional independent artwork proxy address.
+    """
+    plugin.config.update(
+        {
+            "artwork_proxy_base_url": artwork_proxy,
+            "image_proxy_base_url": "images.example.com",
+            "pixiv_cookie": "PHPSESSID=request-secret",
+        }
+    )
+    prefix = "/meta" if artwork_proxy else ""
+    http.routes[prefix + "/ajax/illust/123"] = web.Response(
+        text="invalid-json-response-secret", content_type="application/json"
+    )
+    http.allowed_hosts = {"api.example.com" if artwork_proxy else "www.pixiv.net"}
+    await plugin.pixiv(event, "123")
+    stage = "作品解析（反代）" if artwork_proxy else "作品解析（直连）"
+    message = event.send.call_args.args[0].chain[0].text
+    assert stage in message
+    assert "响应格式无效" in message
+    assert stage in str(plugin.logger.mock_calls)
+    assert "request-secret" not in str(plugin.logger.mock_calls)
+    assert "response-secret" not in str(plugin.logger.mock_calls)
+    assert len(http.requests) == 1
     assert not list((tmp_path / "saved").iterdir())
     assert not list((tmp_path / "temp").iterdir())
 
@@ -404,6 +522,83 @@ async def test_invalid_config(plugin, event, http, config, message):
     assert message in event.send.call_args.args[0].chain[0].text
     assert not http.requests
     assert not plugin._tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["artwork_proxy_base_url", "image_proxy_base_url"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        123,
+        {},
+        "ftp://example.com",
+        "https://",
+        "http:/example.com",
+        "//example.com",
+        "user:password@example.com",
+        "https://user:password@example.com",
+        "example.com?token=secret",
+        "example.com?",
+        "example.com/#fragment",
+        "example.com:bad",
+        "example.com:65536",
+        "example.com:0",
+        "example.com:",
+        "example .com",
+        "example.com\n/path",
+        "https://[::1",
+    ],
+)
+async def test_invalid_proxy_address_stops_before_requests(
+    plugin, event, http, field, value
+):
+    """Reject either invalid proxy address without sending requests or secrets.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting responses.
+        http: Local HTTP routes and request log.
+        field: Artwork or image proxy configuration key.
+        value: Invalid address or configuration type.
+    """
+    plugin.config[field] = value
+    await plugin.pixiv(event, "123")
+    message = event.send.call_args.args[0].chain[0].text
+    assert (
+        "作品解析代理地址" if field == "artwork_proxy_base_url" else "图片下载代理地址"
+    ) in message
+    assert not http.requests
+    assert not plugin._tasks
+    assert "password" not in message
+    assert "secret" not in message
+    assert "password" not in str(plugin.logger.mock_calls)
+    assert "secret" not in str(plugin.logger.mock_calls)
+
+
+@pytest.mark.asyncio
+async def test_image_download_accepts_pre_resolved_pages(plugin, http, tmp_path):
+    """Download supplied pages without accessing any artwork endpoint.
+
+    Args:
+        plugin: Isolated downloader instance.
+        http: Local HTTP routes and request log.
+        tmp_path: Per-test filesystem root.
+    """
+    images = tmp_path / "images"
+    images.mkdir()
+    http.allowed_hosts = {"images.example.com"}
+    pages = [{"urls": {"original": "https://i.pximg.net/images/123_p0.png"}}]
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()) as session:
+        count = await plugin._download(
+            session, "123", images, pages, "https://images.example.com", 1024
+        )
+    assert count == 1
+    assert (images / "123_p0.png").read_bytes() == PNG
+    assert [url for url, _, _ in http.requests] == [
+        "https://images.example.com/images/123_p0.png"
+    ]
+    assert "Cookie" not in http.received[0][2]
 
 
 @pytest.mark.asyncio
@@ -520,12 +715,48 @@ async def test_upload_failure_preserves_archive(plugin, event, http, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_timeout(plugin, event, http, monkeypatch, tmp_path):
+@pytest.mark.parametrize("proxied", [False, True])
+@pytest.mark.parametrize("method", ["_resolve_pages", "_download"])
+@pytest.mark.parametrize(
+    "error_type", [asyncio.TimeoutError, aiohttp.ClientConnectionError]
+)
+async def test_stage_network_failure_reports_route(
+    plugin, event, http, monkeypatch, tmp_path, proxied, method, error_type
+):
+    """Report the failing stage and route without fallback or exception secrets.
+
+    Args:
+        plugin: Isolated downloader instance.
+        event: Message event collecting responses.
+        http: Local HTTP routes and request log.
+        monkeypatch: Pytest replacement manager.
+        tmp_path: Per-test filesystem root.
+        proxied: Whether each stage uses its independent proxy.
+        method: Artwork resolution or image download stage to fail.
+        error_type: Timeout or connection exception to simulate.
+    """
+    if proxied:
+        plugin.config.update(
+            {
+                "artwork_proxy_base_url": "api.example.com",
+                "image_proxy_base_url": "images.example.com",
+            }
+        )
     monkeypatch.setattr(
-        plugin, "_download", AsyncMock(side_effect=asyncio.TimeoutError)
+        plugin, method, AsyncMock(side_effect=error_type("exception-secret"))
     )
     await plugin.pixiv(event, "123")
-    assert "请求超时" in event.send.call_args.args[0].chain[0].text
+    message = event.send.call_args.args[0].chain[0].text
+    stage = "作品解析" if method == "_resolve_pages" else "图片下载"
+    route = "反代" if proxied else "直连"
+    assert f"{stage}（{route}）" in message
+    assert (
+        "请求超时" if error_type is asyncio.TimeoutError else "网络请求异常"
+    ) in message
+    assert len(http.requests) == (0 if method == "_resolve_pages" else 2)
+    assert f"{stage}（{route}）" in str(plugin.logger.mock_calls)
+    assert "exception-secret" not in str(plugin.logger.mock_calls)
+    assert "exception-secret" not in message
     assert not list((tmp_path / "temp").iterdir())
     assert not plugin._tasks
 
@@ -541,6 +772,7 @@ async def test_parallel_tasks_and_termination(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(plugin, "_download", block)
+    monkeypatch.setattr(plugin, "_resolve_pages", AsyncMock(return_value=[{}]))
     first = asyncio.create_task(plugin.pixiv(event, "123"))
     second = asyncio.create_task(plugin.pixiv(event, "456"))
     await asyncio.wait_for(entered.get(), 2)
@@ -1172,14 +1404,16 @@ async def test_encrypted_zip_retained_after_upload_failure(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_size", ["original", "1200", "540"])
+@pytest.mark.parametrize("artwork_proxy", ["", "api.example.com/meta"])
 @pytest.mark.parametrize("proxy", ["", "https://images.example.com/pximg"])
 @pytest.mark.parametrize("delivery", ["direct", "zip", "encrypted"])
 async def test_selected_image_size_for_all_delivery_modes(
-    plugin, event, http, tmp_path, image_size, proxy, delivery
+    plugin, event, http, tmp_path, image_size, artwork_proxy, proxy, delivery
 ):
     plugin.config.update(
         {
             "image_size": image_size,
+            "artwork_proxy_base_url": artwork_proxy,
             "image_proxy_base_url": proxy,
             "direct_send_max_pages": 3 if delivery == "direct" else 0,
             "zip_password": "test-password" if delivery == "encrypted" else "",
@@ -1207,9 +1441,18 @@ async def test_selected_image_size_for_all_delivery_modes(
         for index in range(2)
     ]
     prefix = "/pximg" if proxy else ""
-    http.routes["/ajax/illust/123/pages"] = web.json_response({"body": pages})
-    if proxy:
-        http.allowed_hosts = {"www.pixiv.net", "images.example.com"}
+    api_base = (
+        "https://api.example.com/meta" if artwork_proxy else "https://www.pixiv.net"
+    )
+    api_prefix = "/meta" if artwork_proxy else ""
+    http.routes[api_prefix + "/ajax/illust/123"] = http.routes.pop("/ajax/illust/123")
+    http.routes[api_prefix + "/ajax/illust/123/pages"] = web.json_response(
+        {"body": pages}
+    )
+    http.allowed_hosts = {
+        urlsplit(api_base).hostname,
+        "images.example.com" if proxy else "i.pximg.net",
+    }
     for index in range(2):
         http.routes[prefix + template.format(index)] = web.Response(
             body=content + str(index).encode(),
@@ -1243,8 +1486,8 @@ async def test_selected_image_size_for_all_delivery_modes(
                 assert archive.read(name, pwd=password) == payload
     image_base = proxy or "https://i.pximg.net"
     assert [url for url, _, _ in http.requests] == [
-        "https://www.pixiv.net/ajax/illust/123",
-        "https://www.pixiv.net/ajax/illust/123/pages",
+        api_base + "/ajax/illust/123",
+        api_base + "/ajax/illust/123/pages",
         image_base + template.format(0) + "?token=a%2Fb",
         image_base + template.format(1) + "?token=a%2Fb",
     ]

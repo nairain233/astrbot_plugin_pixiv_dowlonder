@@ -211,6 +211,7 @@ class PixivDownloader(Star):
         self._tasks.add(task)
         pid = str(int(pid))
         archive = None
+        stage = "配置校验"
         try:
             timeout = float(self.config.get("request_timeout", 60))
             limit = float(self.config.get("max_download_mb", 200))
@@ -232,20 +233,41 @@ class PixivDownloader(Star):
             if not isinstance(image_size, str) or image_size not in IMAGE_SIZES:
                 raise PixivDownloadError("图片尺寸必须选择原图、1200 像素或 540 像素。")
             image_label = IMAGE_SIZES[image_size][1]
-            proxy = str(self.config.get("image_proxy_base_url", "")).strip().rstrip("/")
-            if proxy:
-                parsed = urlsplit(proxy)
-                if (
-                    parsed.scheme not in {"http", "https"}
-                    or not parsed.hostname
-                    or parsed.username is not None
-                    or parsed.password is not None
-                    or parsed.query
-                    or parsed.fragment
-                ):
-                    raise PixivDownloadError(
-                        "代理地址应为 HTTP(S) 地址，可含路径前缀，不能含账号、查询参数或片段。"
-                    )
+            proxies = {}
+            for key, label in (
+                ("artwork_proxy_base_url", "作品解析代理地址"),
+                ("image_proxy_base_url", "图片下载代理地址"),
+            ):
+                value = self.config.get(key, "")
+                if not isinstance(value, str):
+                    raise PixivDownloadError(f"{label}必须是字符串。")
+                proxy = value.strip().rstrip("/")
+                if proxy:
+                    if "://" not in proxy:
+                        proxy = f"https://{proxy}"
+                    try:
+                        parsed = urlsplit(proxy)
+                        port = parsed.port
+                    except ValueError:
+                        raise PixivDownloadError(f"{label}格式或端口无效。") from None
+                    if (
+                        parsed.scheme not in {"http", "https"}
+                        or not parsed.hostname
+                        or parsed.username is not None
+                        or parsed.password is not None
+                        or "?" in proxy
+                        or "#" in proxy
+                        or parsed.netloc.endswith(":")
+                        or port == 0
+                        or any(
+                            char.isspace() or ord(char) < 32 or ord(char) == 127
+                            for char in proxy
+                        )
+                    ):
+                        raise PixivDownloadError(
+                            f"{label}应为 HTTP(S) 地址，可省略协议，可含路径前缀，不能含账号、查询参数或片段。"
+                        )
+                proxies[key] = proxy
             cookie = str(self.config.get("pixiv_cookie", "")).strip()
             if "\r" in cookie or "\n" in cookie:
                 raise PixivDownloadError("Cookie 不能包含换行，请检查插件配置。")
@@ -273,16 +295,30 @@ class PixivDownloader(Star):
                         "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.2",
                     },
                 ) as session:
+                    stage = (
+                        "作品解析（反代）"
+                        if proxies["artwork_proxy_base_url"]
+                        else "作品解析（直连）"
+                    )
+                    pages = await self._resolve_pages(
+                        session, pid, cookie, proxies["artwork_proxy_base_url"]
+                    )
+                    stage = (
+                        "图片下载（反代）"
+                        if proxies["image_proxy_base_url"]
+                        else "图片下载（直连）"
+                    )
                     page_count = await self._download(
                         session,
                         pid,
                         images,
-                        cookie,
-                        proxy,
+                        pages,
+                        proxies["image_proxy_base_url"],
                         int(limit * 1024 * 1024),
                         image_size,
                     )
 
+                stage = "文件处理"
                 if 0 < page_count <= direct_pages:
                     for index, image in enumerate(
                         sorted(
@@ -367,26 +403,37 @@ class PixivDownloader(Star):
                 )
             )
         except PixivDownloadError as exc:
-            await event.send(event.plain_result(f"下载失败：{exc}"))
+            await event.send(event.plain_result(f"下载失败：{stage}：{exc}"))
         except asyncio.TimeoutError:
+            self.logger.warning(
+                "Pixiv request timed out for PID %s stage=%s.", pid, stage
+            )
             await event.send(
                 event.plain_result(
-                    "下载失败：请求超时，请检查 Pixiv 直连、图片代理，或调大请求超时。"
+                    f"下载失败：{stage}请求超时，请检查该阶段的网络配置，或调大请求超时。"
                 )
             )
         except aiohttp.ClientError as exc:
             self.logger.warning(
-                "Pixiv network failure for PID %s (%s).", pid, type(exc).__name__
+                "Pixiv network failure for PID %s stage=%s (%s).",
+                pid,
+                stage,
+                type(exc).__name__,
             )
             await event.send(
                 event.plain_result(
-                    "下载失败：网络请求异常，请检查 Pixiv 作品接口直连与图片下载地址的连通性。"
+                    f"下载失败：{stage}网络请求异常，请检查该阶段的直连或反代地址。"
                 )
             )
         except (TypeError, ValueError):
+            self.logger.warning(
+                "Pixiv invalid configuration or response for PID %s stage=%s.",
+                pid,
+                stage,
+            )
             await event.send(
                 event.plain_result(
-                    "下载失败：插件配置或 Pixiv 响应格式无效，请检查配置后重试。"
+                    f"下载失败：{stage}的配置或 Pixiv 响应格式无效，请检查配置后重试。"
                 )
             )
         except OSError as exc:
@@ -441,45 +488,40 @@ class PixivDownloader(Star):
                 archive.write(str(image), arcname=image.name)
         return archive_path
 
-    async def _download(
+    async def _resolve_pages(
         self,
         session: aiohttp.ClientSession,
         pid: str,
-        images: Path,
         cookie: str,
-        proxy: str,
-        limit: int,
-        image_size: str = "original",
-    ) -> int:
-        """Resolve artwork pages and stream the selected versions into a directory.
+        artwork_proxy: str,
+    ) -> list[dict]:
+        """Resolve a static artwork's page data independently of image downloads.
 
         Args:
             session: HTTP session without shared authentication headers.
             pid: Validated numeric artwork ID.
-            images: Empty directory belonging to this request.
-            cookie: Optional login cookie sent only to the official AJAX API.
-            proxy: Optional image proxy base URL, including any path prefix.
-            limit: Maximum cumulative number of downloaded image bytes.
-            image_size: Original, 1200-pixel, or 540-pixel version to request.
+            cookie: Optional login cookie for official or proxied artwork requests.
+            artwork_proxy: Normalized artwork proxy URL; empty selects Pixiv directly.
 
         Returns:
-            Number of successfully downloaded pages.
+            Non-empty page data returned by the artwork pages endpoint.
 
         Raises:
-            PixivDownloadError: The work is inaccessible or an image is invalid.
+            PixivDownloadError: The work is inaccessible or page data is invalid.
             aiohttp.ClientError: An HTTP transport error occurs.
         """
         headers = {
             "Referer": f"https://www.pixiv.net/artworks/{pid}",
             "Accept": "application/json, text/plain, */*",
         }
-        url_key, image_label = IMAGE_SIZES[image_size]
         if cookie:
             headers["Cookie"] = cookie
         pages = []
+        api_base = artwork_proxy or "https://www.pixiv.net"
+        route = "反代" if artwork_proxy else "直连"
         for suffix in ("", "/pages"):
             async with session.get(
-                f"https://www.pixiv.net/ajax/illust/{pid}{suffix}",
+                f"{api_base}/ajax/illust/{pid}{suffix}",
                 headers=headers,
                 params={"lang": "zh"} if suffix else None,
                 allow_redirects=False,
@@ -492,7 +534,7 @@ class PixivDownloader(Star):
                         "Pixiv artwork request failed for PID %s endpoint=%s route=%s status=%s content_type=%s.",
                         pid,
                         "pages" if suffix else "details",
-                        "direct",
+                        "proxy" if artwork_proxy else "direct",
                         response.status,
                         response.content_type,
                     )
@@ -505,10 +547,10 @@ class PixivDownloader(Star):
                 if response.status == 403:
                     if response.content_type != "application/json":
                         raise PixivDownloadError(
-                            "Pixiv 作品信息接口拒绝访问（HTTP 403，直连返回非 JSON 内容）。请检查本机对 www.pixiv.net 的访问限制；图片代理不参与作品信息请求。"
+                            f"Pixiv 作品信息接口拒绝访问（HTTP 403，{route}返回非 JSON 内容）。请检查作品解析接口的访问限制及反代转发规则。"
                         )
                     raise PixivDownloadError(
-                        "Pixiv 作品信息接口拒绝访问（HTTP 403，直连）。请检查作品查看权限、登录状态及本机对 www.pixiv.net 的连通性。"
+                        f"Pixiv 作品信息接口拒绝访问（HTTP 403，{route}）。请检查作品查看权限、登录状态及作品解析地址的连通性。"
                     )
                 if response.status == 404:
                     raise PixivDownloadError("作品不存在、已删除或不可访问。")
@@ -546,6 +588,37 @@ class PixivDownloader(Star):
                     raise PixivDownloadError("该作品没有可下载的原图。")
                 pages = body
 
+        return pages
+
+    async def _download(
+        self,
+        session: aiohttp.ClientSession,
+        pid: str,
+        images: Path,
+        pages: list[dict],
+        image_proxy: str,
+        limit: int,
+        image_size: str = "original",
+    ) -> int:
+        """Stream resolved image versions without artwork credentials or API access.
+
+        Args:
+            session: HTTP session without shared authentication headers.
+            pid: Validated numeric artwork ID used for output filenames.
+            images: Empty directory belonging to this request.
+            pages: Page data already resolved by the artwork stage.
+            image_proxy: Normalized image proxy URL; empty selects original hosts.
+            limit: Maximum cumulative number of downloaded image bytes.
+            image_size: Original, 1200-pixel, or 540-pixel version to request.
+
+        Returns:
+            Number of successfully downloaded pages.
+
+        Raises:
+            PixivDownloadError: An image is invalid or exceeds the size limit.
+            aiohttp.ClientError: An HTTP transport error occurs.
+        """
+        url_key, image_label = IMAGE_SIZES[image_size]
         total = 0
         for index, page in enumerate(pages):
             urls = page.get("urls") if isinstance(page, dict) else None
@@ -564,14 +637,27 @@ class PixivDownloader(Star):
                 raise PixivDownloadError(
                     f"Pixiv 返回了不支持的{image_label}地址或格式。"
                 )
-            if proxy:
-                image_url = proxy + urlunsplit(("", "", parsed.path, parsed.query, ""))
+            if image_proxy:
+                image_url = image_proxy + urlunsplit(
+                    ("", "", parsed.path, parsed.query, "")
+                )
             path = images / f"{pid}_p{index}{Path(parsed.path).suffix.lower()}"
             async with session.get(
                 image_url,
                 headers={"Referer": "https://www.pixiv.net/"},
                 allow_redirects=False,
             ) as response:
+                if response.status != 200 or not response.content_type.startswith(
+                    "image/"
+                ):
+                    self.logger.warning(
+                        "Pixiv image request failed for PID %s page=%s route=%s status=%s content_type=%s.",
+                        pid,
+                        index + 1,
+                        "proxy" if image_proxy else "direct",
+                        response.status,
+                        response.content_type,
+                    )
                 if response.status == 429:
                     raise PixivDownloadError("图片服务器请求过于频繁，请稍后重试。")
                 if response.status == 403:

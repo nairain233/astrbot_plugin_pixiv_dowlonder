@@ -1,6 +1,6 @@
 name: astrbot_plugin_pixiv_dowlonder
 display_name: Pixiv图片打包下载器
-desc: 按 PID 下载 Pixiv 图片，支持原图／1200／540 像素，按页数发图或打包 ZIP，可选密码、一键／定时清理和图片 Worker 代理。
+desc: 按 PID 下载 Pixiv 图片，支持原图／1200／540 像素、按页数发图或加密 ZIP、一键／定时清理，作品解析与图片下载可独立配置反代。
 version: v0.1.1
 author: 夜雨
 repo: https://github.com/nairain233/astrbot_plugin_pixiv_dowlonder
